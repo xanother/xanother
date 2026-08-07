@@ -1,0 +1,408 @@
+# Copyright (c) lezginskiy <xanother-x12@proton.me>
+# SPDX-License-Identifier: MIT
+
+protocol:
+  name: x12
+  idl_format: 1
+  core_version: 1
+
+  wire:
+    byte_order: little-endian
+    alignment: 4
+    message_kinds: [request, event, error]
+    object_id: uint32
+    fd_passing: scm-rights
+    header: [size u32, object u32, opcode u16, reserved u16]
+    rules:
+      # client side allocation avoids round trips, a per connection range
+      # keeps the id space separated between clients
+      - ids are client allocated and never reused within one connection
+      # a uniform implicit header keeps the spark wire parser provable
+      - every event payload starts with an implicit u64 nanosecond timestamp, never listed in args
+      - size counts the whole message including the 12 byte header and the implicit event timestamp
+      - the header is 12 bytes, u64 fields may sit on 4 byte boundaries, targets are little endian only
+      - strings carry no terminating null, the prefix is the exact utf8 byte count, padding bytes must be zero
+      - fd args occupy one 4 byte wire slot holding the ancillary index, the descriptor itself travels in scm-rights
+      - errors are per object events for now, the connection stays alive after an object error
+      - deprecated opcodes keep their numbers forever
+
+  types:
+    - uint32, int32, uint64, int64
+    - fixed24p8   # sign, 24 integer bits, 8 fraction bits, for geometry and scale
+    - string      # length prefixed utf8, no interior null bytes
+    - fd          # sent only over scm-rights capable transports
+    - object      # existing object id
+    - new_id      # id allocated by the client for a fresh object
+    - array_u32   # count u32 followed by u32 elements, 4 byte aligned, of uint32 or of an enum
+    - enum        # uint32 carrying a value from a root or interface enum
+
+enums:
+  # root level enums are shared across interfaces, interface level enums stay private
+  x12_capability:
+    # none marks an interface every client may bind, it is a global value so
+    # registry.global can name the requirement without a special case
+    - none
+    - seat
+    - output-info
+    - screencopy
+  x12_error_code:
+    - invalid-id
+    - no-capability
+    - out-of-memory
+    - implementation
+    - bad-value
+
+interfaces:
+
+  - name: x12_connection
+    version: 1
+    singleton: true
+    summary: handshake, clock sync, global error reporting
+    requests:
+      - {name: hello, opcode: 0, args: [{name: idl_major, type: uint32}, {name: idl_minor, type: uint32}]}
+      - {name: sync, opcode: 1, args: [{name: callback, type: new_id, interface: x12_callback}]}
+      - {name: shutdown, opcode: 2, args: []}
+    events:
+      # capabilities gate registry.bind: without a matching cap the bind is refused
+      - {name: welcome, opcode: 0, args: [{name: caps, type: array_u32, of: x12_capability}, {name: server_version, type: uint32}]}
+      - {name: error, opcode: 1, args: [{name: code, type: enum, of: x12_error_code}, {name: object, type: object}]}
+
+  - name: x12_callback
+    version: 1
+    summary: generic one shot continuation
+    requests: []
+    events:
+      - {name: done, opcode: 0, args: [{name: serial, type: uint32}]}
+
+  - name: x12_compositor
+    version: 2
+    summary: factory for surfaces, regions and window roles, bindable without a capability
+    requests:
+      - {name: create_surface, opcode: 0, args: [{name: id, type: new_id, interface: x12_surface}]}
+      - {name: create_region, opcode: 1, args: [{name: id, type: new_id, interface: x12_region}]}
+      # roles attach to a surface, an unroled surface is never composited
+      - {name: create_positioner, opcode: 2, args: [{name: id, type: new_id, interface: x12_positioner}]}
+      - {name: create_toplevel, opcode: 3, args: [{name: id, type: new_id, interface: x12_toplevel}, {name: surface, type: object, interface: x12_surface}]}
+      - {name: create_popup, opcode: 4, args: [{name: id, type: new_id, interface: x12_popup}, {name: surface, type: object, interface: x12_surface}, {name: parent, type: object, interface: x12_surface}, {name: positioner, type: object, interface: x12_positioner}]}
+
+  - name: x12_positioner
+    version: 1
+    summary: placement description for popups, values are copied when the popup is created
+    requests:
+      - {name: set_anchor_rect, opcode: 0, args: [{name: x, type: int32}, {name: y, type: int32}, {name: width, type: uint32}, {name: height, type: uint32}]}
+      # the anchor picks one point of the anchor rect, gravity names the
+      # direction the popup expands toward, offset shifts the result
+      - {name: set_anchor, opcode: 1, args: [{name: anchor, type: enum, of: anchor_kind}]}
+      - {name: set_gravity, opcode: 2, args: [{name: gravity, type: enum, of: anchor_kind}]}
+      - {name: set_offset, opcode: 3, args: [{name: x, type: int32}, {name: y, type: int32}]}
+    enums:
+      anchor_kind:
+        - none
+        - center
+        - top
+        - bottom
+        - left
+        - right
+
+  - name: x12_registry
+    version: 2
+    singleton: true
+    summary: discovery of interface factories, gated by capabilities
+    requests:
+      # refusing instead of returning a stub keeps failures loud
+      # v2: the instance picks among globals the server advertises more
+      # than once, every x12_output instance is one physical output,
+      # singletons ignore it and refuse anything above zero
+      - {name: bind, opcode: 0, args: [{name: name, type: string}, {name: version, type: uint32}, {name: id, type: new_id}, {name: instance, type: uint32}]}
+    events:
+      - {name: global, opcode: 0, args: [{name: name, type: string}, {name: version, type: uint32}, {name: required_cap, type: enum, of: x12_capability}, {name: instance, type: uint32}]}
+
+  - name: x12_output
+    version: 2
+    summary: physical output, modes, scale, hotplug, presentation feedback
+    requests:
+      - {name: release, opcode: 0, args: []}
+      # v2: variable refresh rate toggle, anything above 1 is refused
+      # with bad-value, hosts without vrr support refuse the same way
+      - {name: set_vrr, opcode: 1, args: [{name: enable, type: uint32}]}
+    events:
+      # refresh in millihertz keeps fractional rates like 59.94 lossless
+      - {name: mode, opcode: 0, args: [{name: width, type: uint32}, {name: height, type: uint32}, {name: refresh_millihz, type: uint32}, {name: preferred, type: enum, of: mode_flag}]}
+      - {name: geometry, opcode: 1, args: [{name: x, type: int32}, {name: y, type: int32}, {name: physical_width_mm, type: uint32}, {name: physical_height_mm, type: uint32}]}
+      - {name: scale, opcode: 2, args: [{name: scale, type: fixed24p8}]}
+      - {name: name, opcode: 3, args: [{name: name, type: string}]}
+      - {name: removed, opcode: 4, args: []}
+      # v2: presentation feedback, the implicit timestamp is the scanout
+      # moment the display picked the frame up. the token names the commit
+      # that reached the screen, flip means a page flip carried it and the
+      # buffer that left the screen is the one that commit attached, its
+      # release event then credits it. copy means the pixels went out
+      # immediately
+      - {name: present, opcode: 5, args: [{name: commit_token, type: uint64}, {name: kind, type: enum, of: present_kind}]}
+      - {name: vrr, opcode: 6, args: [{name: enabled, type: uint32}, {name: min_refresh_millihz, type: uint32}, {name: max_refresh_millihz, type: uint32}]}
+    enums:
+      mode_flag:
+        - current
+        - preferred
+      present_kind:
+        - flip
+        - copy
+
+  - name: x12_surface
+    version: 3
+    summary: drawable unit, all state applied atomically by commit
+    requests:
+      - {name: destroy, opcode: 0, args: []}
+      # the buffer slot is per commit state, the buffer id in it is what
+      # earns the release credit after the server stops reading it
+      - {name: set_buffer, opcode: 1, args: [{name: buffer, type: object, interface: x12_buffer, nullable: true}]}
+      - {name: set_transform, opcode: 2, args: [{name: transform, type: enum, of: transform_kind}]}
+      # fractional scale lives in the core, not in an addon, so clients never ship a fallback path
+      - {name: set_scale, opcode: 3, args: [{name: scale, type: fixed24p8}]}
+      - {name: set_sync, opcode: 4, args: [{name: policy, type: enum, of: sync_policy}]}
+      # damage rectangles are in surface logical coordinates, the
+      # compositor maps them to buffer pixels through the surface scale
+      - {name: damage, opcode: 5, args: [{name: x, type: int32}, {name: y, type: int32}, {name: width, type: int32}, {name: height, type: int32}]}
+      - {name: frame, opcode: 6, args: [{name: callback, type: new_id, interface: x12_callback}]}
+      # every commit that carries a buffer owes exactly one release credit
+      # to that buffer id, credits leave through x12_buffer.release in
+      # commit order. commit also mints a monotonic token, the committed
+      # event reports it and x12_output.present echoes it
+      - {name: commit, opcode: 7, args: []}
+      # v2: explicit sync for gpu rendered buffers, the fence is a
+      # sync_file the client armed before commit, the server holds the
+      # commit until the fence signals so the scanout never reads
+      # mid-render memory; calling it again replaces the pending fence
+      - {name: set_commit_fence, opcode: 8, args: [{name: fence, type: fd}]}
+    events:
+      - {name: configure, opcode: 0, args: [{name: width, type: uint32}, {name: height, type: uint32}]}
+      # the server minted the token for the commit this client made, the
+      # token later identifies the commit in x12_output.present, so the
+      # feedback always names a real commit instead of a fresh serial
+      - {name: committed, opcode: 1, args: [{name: token, type: uint64}]}
+    enums:
+      transform_kind:
+        - none
+        - rotate-90
+        - rotate-180
+        - rotate-270
+      sync_policy:
+        # async means the client accepts tearing, the compositor may skip frames
+        - vsync
+        - async
+
+  - name: x12_toplevel
+    version: 2
+    summary: window role of a surface, mechanisms only, no decorations
+    requests:
+      - {name: destroy, opcode: 0, args: []}
+      - {name: set_title, opcode: 1, args: [{name: title, type: string}]}
+      - {name: set_app_id, opcode: 2, args: [{name: app_id, type: string}]}
+      - {name: set_min_size, opcode: 3, args: [{name: width, type: uint32}, {name: height, type: uint32}]}
+      - {name: set_max_size, opcode: 4, args: [{name: width, type: uint32}, {name: height, type: uint32}]}
+      - {name: ack_configure, opcode: 5, args: [{name: serial, type: uint32}]}
+      # the client asks for the state, the server answers with a
+      # configure offer carrying the fullscreen state and the geometry
+      # it can actually give; anything above 1 is refused with bad-value
+      - {name: set_fullscreen, opcode: 6, args: [{name: state, type: uint32}]}
+    events:
+      - {name: configure, opcode: 0, args: [{name: width, type: uint32}, {name: height, type: uint32}, {name: states, type: array_u32, of: window_state}, {name: serial, type: uint32}]}
+      - {name: close, opcode: 1, args: []}
+    enums:
+      window_state:
+        - activated
+        - maximized
+        - fullscreen
+        - tiled
+
+  - name: x12_popup
+    version: 1
+    summary: transient role for menus and tooltips, replaces override-redirect
+    requests:
+      # the serial must reference a button press this connection actually
+      # received, an invented serial is refused with bad-value and the
+      # popup never arms
+      - {name: grab, opcode: 0, args: [{name: seat, type: object, interface: x12_seat}, {name: serial, type: uint32}]}
+      - {name: destroy, opcode: 1, args: []}
+      - {name: ack_configure, opcode: 2, args: [{name: serial, type: uint32}]}
+    events:
+      - {name: configure, opcode: 0, args: [{name: width, type: uint32}, {name: height, type: uint32}, {name: serial, type: uint32}]}
+      - {name: dismiss, opcode: 1, args: []}
+
+  - name: x12_buffer_manager
+    version: 1
+    summary: buffer factory, formats and modifiers for the device the server composites on
+    requests:
+      - {name: create_shm_pool, opcode: 0, args: [{name: fd, type: fd}, {name: size, type: uint32}, {name: id, type: new_id, interface: x12_shm_pool}]}
+      # single plane for now, multi plane waits for the dmabuf feedback design decision
+      - {name: import_dmabuf, opcode: 1, args: [{name: fd, type: fd}, {name: width, type: uint32}, {name: height, type: uint32}, {name: format, type: uint32}, {name: modifier, type: uint64}, {name: stride, type: uint32}, {name: id, type: new_id, interface: x12_buffer}]}
+    events:
+      - {name: format, opcode: 0, args: [{name: fourcc, type: uint32}]}
+      - {name: modifier, opcode: 1, args: [{name: fourcc, type: uint32}, {name: modifier, type: uint64}]}
+
+  - name: x12_shm_pool
+    version: 1
+    summary: shared memory slab, buffers are carved out of it
+    requests:
+      - {name: create_buffer, opcode: 0, args: [{name: offset, type: uint32}, {name: width, type: uint32}, {name: height, type: uint32}, {name: stride, type: uint32}, {name: format, type: uint32}, {name: id, type: new_id, interface: x12_buffer}]}
+      - {name: destroy, opcode: 1, args: []}
+
+  - name: x12_buffer
+    version: 1
+    summary: content container, released only after the server stops reading it
+    requests:
+      - {name: destroy, opcode: 0, args: []}
+    events:
+      # the release credit belongs to the buffer this event names, the
+      # server dispatches it to the committed buffer id and never to the
+      # surface currently showing it. reuse before release would corrupt
+      # a frame still in scanout
+      - {name: release, opcode: 0, args: []}
+
+  - name: x12_region
+    version: 1
+    summary: rectangle set for damage and opaque hints
+    requests:
+      - {name: add_rect, opcode: 0, args: [{name: x, type: int32}, {name: y, type: int32}, {name: width, type: int32}, {name: height, type: int32}]}
+      - {name: subtract_rect, opcode: 1, args: [{name: x, type: int32}, {name: y, type: int32}, {name: width, type: int32}, {name: height, type: int32}]}
+      - {name: destroy, opcode: 2, args: []}
+
+  - name: x12_seat
+    version: 2
+    summary: input seat, capability gated
+    requests:
+      - {name: get_pointer, opcode: 0, args: [{name: id, type: new_id, interface: x12_pointer}]}
+      - {name: get_keyboard, opcode: 1, args: [{name: id, type: new_id, interface: x12_keyboard}]}
+      - {name: get_touch, opcode: 2, args: [{name: id, type: new_id, interface: x12_touch}]}
+      - {name: release, opcode: 3, args: []}
+      # v2: the clipboard device, selection transport stays native until
+      # the phase 5 bridge
+      - {name: get_data_device, opcode: 4, args: [{name: id, type: new_id, interface: x12_data_device}]}
+    events:
+      - {name: capabilities, opcode: 0, args: [{name: value, type: uint32}]}
+      - {name: name, opcode: 1, args: [{name: name, type: string}]}
+    enums:
+      device_class:
+        - pointer
+        - keyboard
+        - touch
+
+  - name: x12_pointer
+    version: 1
+    summary: pointer events in surface local fixed coordinates, button indices 1 left, 2 right, 3 middle
+    requests:
+      - {name: set_cursor, opcode: 0, args: [{name: serial, type: uint32}, {name: surface, type: object, interface: x12_surface, nullable: true}, {name: hotspot_x, type: int32}, {name: hotspot_y, type: int32}]}
+      - {name: release, opcode: 1, args: []}
+    events:
+      - {name: enter, opcode: 0, args: [{name: serial, type: uint32}, {name: surface, type: object}, {name: x, type: fixed24p8}, {name: y, type: fixed24p8}]}
+      - {name: leave, opcode: 1, args: [{name: serial, type: uint32}, {name: surface, type: object}]}
+      - {name: motion, opcode: 2, args: [{name: surface, type: object}, {name: x, type: fixed24p8}, {name: y, type: fixed24p8}]}
+      - {name: button, opcode: 3, args: [{name: serial, type: uint32}, {name: button, type: uint32}, {name: state, type: enum, of: button_state}]}
+      - {name: axis, opcode: 4, args: [{name: axis, type: enum, of: axis_kind}, {name: value, type: fixed24p8}]}
+      - {name: axis_stop, opcode: 5, args: [{name: axis, type: enum, of: axis_kind}]}
+      # frame batches the events above, clients must not act before it
+      - {name: frame, opcode: 6, args: []}
+    enums:
+      button_state:
+        - pressed
+        - released
+      axis_kind:
+        - vertical-scroll
+        - horizontal-scroll
+
+  - name: x12_keyboard
+    version: 1
+    summary: keyboard events, keymap shipped by the server as an fd, key codes are linux evdev codes
+    requests:
+      - {name: release, opcode: 0, args: []}
+    events:
+      - {name: keymap, opcode: 0, args: [{name: format, type: enum, of: keymap_format}, {name: fd, type: fd}, {name: size, type: uint32}]}
+      - {name: enter, opcode: 1, args: [{name: serial, type: uint32}, {name: surface, type: object}, {name: keys, type: array_u32, of: uint32}]}
+      - {name: leave, opcode: 2, args: [{name: serial, type: uint32}, {name: surface, type: object}]}
+      - {name: key, opcode: 3, args: [{name: serial, type: uint32}, {name: key, type: uint32}, {name: state, type: enum, of: key_state}]}
+      # modifier masks use the xkb canonical modifier indices of the
+      # shipped keymap: shift 1<<0, caps lock 1<<1, control 1<<2,
+      # alt 1<<3, num lock 1<<4, logo 1<<6; latched stays unused until a
+      # layout switching source exists, group is 0 for a v1 keymap. a
+      # modifiers event follows every focus enter and every state change
+      - {name: modifiers, opcode: 4, args: [{name: serial, type: uint32}, {name: mods_depressed, type: uint32}, {name: mods_locked, type: uint32}, {name: mods_latched, type: uint32}, {name: group, type: uint32}]}
+      # server repeat policy, clients synthesize repeats from these
+      # parameters, the server never re-sends key events
+      - {name: repeat_info, opcode: 5, args: [{name: rate, type: uint32}, {name: delay, type: uint32}]}
+    enums:
+      keymap_format:
+        - xkb-v1
+      key_state:
+        - pressed
+        - released
+
+  - name: x12_touch
+    version: 1
+    summary: multitouch, ids distinguish simultaneous contacts
+    requests:
+      - {name: release, opcode: 0, args: []}
+    events:
+      - {name: down, opcode: 0, args: [{name: serial, type: uint32}, {name: surface, type: object}, {name: id, type: uint32}, {name: x, type: fixed24p8}, {name: y, type: fixed24p8}]}
+      - {name: up, opcode: 1, args: [{name: serial, type: uint32}, {name: id, type: uint32}]}
+      - {name: motion, opcode: 2, args: [{name: id, type: uint32}, {name: x, type: fixed24p8}, {name: y, type: fixed24p8}]}
+      - {name: cancel, opcode: 3, args: []}
+
+  - name: x12_data_source
+    version: 1
+    summary: clipboard content offered by a client
+    requests:
+      - {name: offer, opcode: 0, args: [{name: mime, type: string}]}
+      - {name: destroy, opcode: 1, args: []}
+    events:
+      - {name: send, opcode: 0, args: [{name: mime, type: string}, {name: fd, type: fd}]}
+      - {name: cancelled, opcode: 1, args: []}
+
+  - name: x12_data_offer
+    version: 1
+    summary: clipboard content received by a client, created only through data_device get requests
+    requests:
+      - {name: receive, opcode: 0, args: [{name: mime, type: string}, {name: fd, type: fd}]}
+      - {name: destroy, opcode: 1, args: []}
+    events:
+      - {name: offer, opcode: 0, args: [{name: mime, type: string}]}
+      # the selection behind this offer was replaced or cleared, the
+      # offer object is dead and the client must drop it
+      - {name: finished, opcode: 1, args: []}
+
+  - name: x12_data_device
+    version: 2
+    summary: clipboard and primary selection, drag and drop staged for interface v2
+    requests:
+      - {name: set_selection, opcode: 0, args: [{name: source, type: object, interface: x12_data_source, nullable: true}]}
+      # the middle button selection is core, addons were the wayland mistake
+      - {name: set_primary, opcode: 1, args: [{name: source, type: object, interface: x12_data_source, nullable: true}]}
+      - {name: release, opcode: 2, args: []}
+      # pull model: events never carry ids the receiver did not choose,
+      # the client learns about a selection from the signal below and
+      # pulls the mime list into its own offer object; refused loudly
+      # with bad-value while the selection is empty
+      - {name: get_selection, opcode: 3, args: [{name: id, type: new_id, interface: x12_data_offer}]}
+      - {name: get_primary, opcode: 4, args: [{name: id, type: new_id, interface: x12_data_offer}]}
+      # v2: the source factory, the wl_data_device_manager.create_data_source
+      # precedent; without it the pull model has no request that creates
+      # the object set_selection and set_primary consume
+      - {name: create_source, opcode: 5, args: [{name: id, type: new_id, interface: x12_data_source}]}
+    events:
+      # generation increments on every selection change, 0 means the
+      # connection never saw one; stale generations are ignorable
+      - {name: selection, opcode: 0, args: [{name: generation, type: uint32}]}
+      - {name: primary, opcode: 1, args: [{name: generation, type: uint32}]}
+
+  - name: x12_screencopy
+    version: 1
+    summary: one shot frame capture, strictly capability gated
+    requests:
+      - {name: capture_frame, opcode: 0, args: [{name: output, type: object, interface: x12_output}, {name: buffer, type: object, interface: x12_buffer}]}
+    events:
+      - {name: done, opcode: 0, args: [{name: copied, type: enum, of: copy_result}]}
+      - {name: failed, opcode: 1, args: [{name: reason, type: enum, of: copy_result}]}
+    enums:
+      copy_result:
+        - complete
+        - buffer-too-small
+        - output-gone
