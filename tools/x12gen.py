@@ -1,256 +1,368 @@
 # Copyright (c) lezginskiy <xanother-x12@proton.me>
 # SPDX-License-Identifier: MIT
 
-"""compile x12 idl into c wire tables and verify field alignment."""
+# codegen for the x12 protocol, reads the idl and emits c and ada
+# declarations. generation is a build step, the emitted files are never
+# committed. the wire layout rules here must stay in lockstep with
+# tests/wire_model.py, the test suite fails on any divergence.
 
 import argparse
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
 
-ROOT = Path(__file__).resolve().parents[1]
-SPEC = ROOT / "spec" / "x12-core.yaml"
-
-
-@dataclass
-class Field:
-    name: str
-    type: str
-    c_type: str
-    array: bool
-    size: int
-    align: int
-    offset: int
-    present: bool
-
-
-@dataclass
-class Message:
-    ifname: str
-    direction: str  # request or event
-    name: str
-    opcode: int
-    version: int
-    fields: list
-    payload_size: int
-
-
-HEADER_SIZE = 12
-TS_SIZE = 8
-TYPE_SIZES = {
-    "u8": 1, "u16": 2, "u32": 4, "u64": 8,
-    "i32": 4, "fixed": 4,
-    "str": 4, "id": 4, "fd": 0,
-    "strarray": 8, "idarray": 8,
+KNOWN_ARG_TYPES = {
+    "uint32", "int32", "uint64", "int64",
+    "fixed24p8", "string", "fd", "object", "new_id", "array_u32", "enum",
 }
-ARRAY_TYPES = {"strarray", "idarray"}
-STR_TYPES = {"str", "strarray"}
 
 
-def c_type(typ: str, types: dict) -> str:
-    if typ in types:
-        return types[typ]["c"]
-    return f"x12_id"
+class _StrictLoader(yaml.SafeLoader):
+    pass
 
 
-def align_to(value: int, align: int) -> int:
-    return (value + align - 1) & ~(align - 1)
+def _no_dup_keys(loader, node, deep=False):
+    seen = {}
+    for k_node, v_node in node.value:
+        key = loader.construct_object(k_node, deep=deep)
+        if key in seen:
+            raise yaml.constructor.ConstructorError(
+                None, None, f"duplicate key {key!r} in mapping", node.start_mark)
+        seen[key] = loader.construct_object(v_node, deep=deep)
+    return seen
 
 
-def load_idl(path: Path) -> dict:
-    with open(path, "r", encoding="utf-8") as handle:
-        data = yaml.safe_load(handle)
-    return data
+_StrictLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _no_dup_keys)
 
 
-def build_messages(idl: dict) -> list:
-    proto = idl["protocol"]
-    types = proto["types"]
-    messages = []
-    for ifname, iface in sorted(idl["interfaces"].items()):
-        for direction in ("requests", "events"):
-            entries = iface.get(direction, {}) or {}
-            for msgname, meta in sorted(entries.items(), key=lambda kv: kv[1]["opcode"]):
-                fields = []
-                # implicit timestamp after the 12 byte header, always u64.
-                fields.append(Field("__ts", "u64", "u64", False, 8, 8, HEADER_SIZE, False))
-                offset = HEADER_SIZE + TS_SIZE
-                for arg in meta["args"]:
-                    if isinstance(arg, str):
-                        name, typ, present = arg, "u32", True
-                    else:
-                        name, typ = arg["name"], arg["type"]
-                        present = arg.get("present", True)
-                    array = typ in ARRAY_TYPES
-                    size = TYPE_SIZES[typ]
-                    align = 8 if array else size
-                    if typ == "fd":
-                        align = 0
-                    offset = align_to(offset, align) if align else offset
-                    fields.append(Field(name, typ, c_type(typ, types), array, size, align, offset, present))
-                    if align:
-                        offset += size
-                messages.append(Message(ifname, "request" if direction == "requests" else "event",
-                                        msgname, meta["opcode"], meta.get("since", 1), fields, offset))
-    return messages
+def load_idl(path):
+    raw = yaml.load(Path(path).read_text(encoding="utf-8"), Loader=_StrictLoader)
+    errors = validate(raw)
+    if errors:
+        raise ValueError("idl validation failed:\n" + "\n".join("- " + e for e in errors))
+    return raw
 
 
-def payload_size(fields: list) -> int:
-    return max(f.offset + (f.size if f.align else 0) for f in fields)
+def collect_enums(root):
+    # flat list in declaration order, index is the wire stable enum id used
+    # by generated tables; names must be globally unique (validator enforces)
+    entries = list((root.get("enums") or {}).items())
+    for iface in root["interfaces"]:
+        entries.extend((iface.get("enums") or {}).items())
+    return entries
 
 
-def header_bytes(message: Message) -> int:
-    return HEADER_SIZE + payload_size(message.fields)
+def validate(root):
+    errors = []
+    proto = root.get("protocol", {})
+    if proto.get("idl_format") != 1:
+        errors.append("protocol.idl_format must be 1")
+    wire = proto.get("wire", {})
+    if wire.get("byte_order") != "little-endian" or wire.get("alignment") != 4:
+        errors.append("wire.byte_order and wire.alignment are fixed by the spec")
+
+    interfaces = root.get("interfaces", [])
+    names = [i.get("name") for i in interfaces]
+    if len(names) != len(set(names)):
+        errors.append("duplicate interface names")
+
+    enum_names = list((root.get("enums") or {}).keys())
+    for iface in interfaces:
+        enum_names.extend((iface.get("enums") or {}).keys())
+    if len(enum_names) != len(set(enum_names)):
+        errors.append("enum names must be unique across the protocol")
+
+    for iface in interfaces:
+        iname = iface.get("name", "<no name>")
+        if not iname.startswith("x12_"):
+            errors.append(f"{iname}: interface names must start with x12_")
+        if iface.get("version", 0) < 1:
+            errors.append(f"{iname}: version must be >= 1")
+        kinds = (("requests", "opcode"), ("events", "opcode"))
+        for list_key, opcode_key in kinds:
+            seen = set()
+            for msg in iface.get(list_key, []) or []:
+                mname = msg.get("name", "<no name>")
+                op = msg.get(opcode_key)
+                if op is None:
+                    errors.append(f"{iname}.{mname}: missing {opcode_key}")
+                elif op in seen:
+                    errors.append(f"{iname}.{mname}: duplicate {opcode_key} {op}")
+                else:
+                    seen.add(op)
+                for arg in msg.get("args", []) or []:
+                    errors.extend(_check_arg(iname, mname, arg, names, iface, root.get("enums") or {}))
+
+        # enum symbols are wire values, their declaration order is the value
+        for ename, symbols in (iface.get("enums") or {}).items():
+            if len(symbols) != len(set(symbols)):
+                errors.append(f"{iname}.{ename}: duplicate enum symbols")
+            for s in symbols:
+                if not s.replace("-", "").replace("_", "").isalnum():
+                    errors.append(f"{iname}.{ename}.{s}: bad symbol charset")
+    return errors
 
 
-def _align_pad(fields: list, sizes: dict) -> list:
-    """return copy of fields where fd fields widen to pad the wire slot.
-
-    fd does not travel on the wire, the idl still reserves its slot so the
-    generated codec mirrors the fixed header rules of the reference model.
-    """
-    result = []
-    for field in fields:
-        if field.type != "fd":
-            result.append(field)
-            continue
-        idx = fields.index(field)
-        width = 0
-        if idx + 1 < len(fields):
-            nxt = fields[idx + 1]
-            if nxt.align == 8 and field.offset % 8:
-                width = 8 - (field.offset % 8)
-        result.append(Field(field.name, "pad", "u8", False, width, 1, field.offset, True))
-    return result
+def _enum_declared(iface_enums, root_enums, name):
+    return name in iface_enums or name in root_enums
 
 
-def render_struct(message: Message, idl: dict) -> str:
-    lines = [f"typedef struct x12_{message.ifname}_{message.name}_t {{"]
-    lines.append(f"    uint32_t object_id;")
-    for field in _align_pad(message.fields, idl["protocol"]["types"]):
-        if field.name == "__ts":
-            lines.append(f"    uint64_t timestamp;")
-            continue
-        if field.type == "pad":
-            lines.append(f"    uint8_t {field.name}[{field.size}];")
-            continue
-        ctype = field.c_type
-        if field.type in STR_TYPES:
-            lines.append(f"    {ctype} {field.name};")
-        elif field.array:
-            lines.append(f"    const {ctype} {field.name};")
-            lines.append(f"    size_t {field.name}_count;")
-        else:
-            lines.append(f"    {ctype} {field.name};")
-    lines.append(f"}} x12_{message.ifname}_{message.name}_t;")
-    return "\n".join(lines)
+def _check_arg(iname, mname, arg, interface_names, iface, root_enums):
+    errors = []
+    aname = arg.get("name", "<no name>")
+    atype = arg.get("type")
+    if atype not in KNOWN_ARG_TYPES:
+        errors.append(f"{iname}.{mname}.{aname}: unknown type {atype}")
+    if atype == "enum" and not _enum_declared(iface.get("enums") or {}, root_enums, arg.get("of")):
+        errors.append(f"{iname}.{mname}.{aname}: enum.of {arg.get('of')} not declared")
+    if atype == "array_u32":
+        of = arg.get("of")
+        if not of:
+            errors.append(f"{iname}.{mname}.{aname}: array_u32 requires 'of'")
+        elif of != "uint32" and not _enum_declared(iface.get("enums") or {}, root_enums, of):
+            errors.append(f"{iname}.{mname}.{aname}: array of {of} not declared")
+    if arg.get("nullable") and atype not in ("object", "fd"):
+        errors.append(f"{iname}.{mname}.{aname}: only object and fd may be nullable")
+    if atype in ("object", "new_id") and arg.get("interface") and \
+            arg["interface"] not in interface_names:
+        errors.append(f"{iname}.{mname}.{aname}: interface {arg['interface']} not declared")
+    return errors
 
 
-def gen_c(idl: dict, messages: list, outdir: Path) -> None:
-    outdir.mkdir(parents=True, exist_ok=True)
-    header = [
-        "// Copyright (c) lezginskiy <xanother-x12@proton.me>",
-        "// SPDX-License-Identifier: MIT",
-        "",
-        "// generated from spec/x12-core.yaml, do not edit.",
-        "",
-        "#pragma once",
-        "#include <stddef.h>",
-        "#include <stdint.h>",
-        '#include "x12_wire.h"',
-        "",
-    ]
-    for message in messages:
-        header.append(render_struct(message, idl))
-        header.append("")
-    (outdir / "x12_protocol.h").write_text("\n".join(header), encoding="utf-8")
-
-    sizes = []
-    tables = [
-        "// Copyright (c) lezginskiy <xanother-x12@proton.me>",
-        "// SPDX-License-Identifier: MIT",
-        "",
-        "// generated from spec/x12-core.yaml, do not edit.",
-        "",
-        '#include "x12_protocol.h"',
-        "",
-    ]
-    for message in messages:
-        token = f"{message.ifname}_{message.name}"
-        tables.append(f"static const x12_arg_desc_t args_{token}[] = {{")
-        for field in _align_pad(message.fields, idl["protocol"]["types"]):
-            name = "timestamp" if field.name == "__ts" else field.name
-            kind = {"str": "str", "strarray": "strarray", "id": "id", "idarray": "idarray",
-                    "fd": "fd", "pad": "pad"}.get(field.type, "uint")
-            enum_name = "NULL"
-            tables.append(
-                f'    {{ "{name}", "{field.type}", "{kind}", {field.size}, {field.offset}, '
-                f'{1 if field.present else 0}, {field.size if field.align else 0}, {enum_name} }},'
-            )
-        tables.append("};")
-        sizes.append(f"    sizeof(x12_{token}_t)")
-    tables.append("")
-    tables.append(f"const size_t x12_generated_struct_sizes[{len(messages) + 1}] = {{")
-    tables.append("    0,")
-    for value in sizes:
-        tables.append(f"{value},")
-    tables.append("};")
-    tables.append("")
-    index = 0
-    enum_names = {}
-    for enum_name, items in sorted(idl["protocol"]["enums"].items()):
-        enum_names[enum_name] = {item["name"]: item["id"] for item in items}
-    for message in messages:
-        token = f"{message.ifname}_{message.name}"
-        index += 1
-        iface_version = idl["interfaces"][message.ifname]["version"]
-        tables.append(
-            f'const x12_msg_desc_t x12_msg_{token} = {{ "{message.ifname}", "{message.name}", '
-            f'"{token}", {message.ifname.count("_")}, {message.ifname}, {index}, {message.ifname.count("_")}, '
-            f'{message.ifname.count("_")}, {message.ifname.count("_")}, {iface_version}, '
-            f'{message.ifname.count("_")}, "{message.ifname}.{message.name}", {message.opcode}, '
-            f'"{message.direction}", {message.ifname.count("_")}, {header_bytes(message)}, '
-            f'{message.ifname.count("_")}, {len(message.fields)}, args_{token} }};'
-        )
-    (outdir / "x12_tables.c").write_text("\n".join(tables), encoding="utf-8")
+def _macro_prefix(iname):
+    # x12_connection -> X12_CONNECTION
+    return iname.upper()
 
 
-def check_alignment(messages: list) -> list:
-    problems = []
-    for message in messages:
-        for field in message.fields:
-            if field.align and field.offset % field.align:
-                problems.append(f"{message.ifname}.{message.name}.{field.name} offset {field.offset} align {field.align}")
-        size = header_bytes(message)
-        if size % 8:
-            problems.append(f"{message.ifname}.{message.name} message size {size} not aligned")
-    return problems
+def _c_enum_name(iname, ename):
+    # enums already named x12_* keep their name, others get the interface prefix
+    return ename if ename.startswith("x12_") else f"{iname}_{ename}"
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("idl", nargs="?", default=str(SPEC))
-    ap.add_argument("--out", default=None)
-    ap.add_argument("--check", action="store_true")
-    ap.add_argument("--lang", default="c", choices=["c"])
-    args = ap.parse_args()
+def gen_c(root):
+    out = []
+    out.append("// Copyright (c) lezginskiy <xanother-x12@proton.me>")
+    out.append("// SPDX-License-Identifier: MIT")
+    out.append("//")
+    out.append("// generated from spec/x12-core.yaml by x12gen, do not edit")
+    out.append("#ifndef X12_PROTOCOL_H")
+    out.append("#define X12_PROTOCOL_H")
+    out.append("")
+    out.append("#include <stdint.h>")
+    out.append("")
+    proto = root["protocol"]
+    out.append(f"#define X12_IDL_FORMAT {proto['idl_format']}")
+    out.append(f"#define X12_CORE_VERSION {proto['core_version']}")
+    out.append("")
+    out.append("// wire header, size counts the whole message including these 12 bytes")
+    out.append("struct x12_msg_header {")
+    out.append("    uint32_t size;")
+    out.append("    uint32_t object;")
+    out.append("    uint16_t opcode;")
+    out.append("    uint16_t reserved;")
+    out.append("};")
+    out.append("_Static_assert(sizeof(struct x12_msg_header) == 12, \"wire header must be 12 bytes\");")
+    out.append("")
+    out.append("// sign, 24 integer bits, 8 fraction bits")
+    out.append("typedef int32_t x12_fixed24p8;")
+    out.append("#define X12_FIXED24P8_ONE 256")
+    out.append("")
 
-    idl = load_idl(Path(args.idl))
-    messages = build_messages(idl)
+    # root level enums are shared across interfaces
+    for ename, symbols in (root.get("enums") or {}).items():
+        out.append(f"enum {ename.lower()} {{")
+        for value, sym in enumerate(symbols):
+            out.append(f"    {ename.upper()}_{sym.upper().replace('-', '_')} = {value},")
+        out.append("};")
+    out.append("")
 
-    if args.check:
-        problems = check_alignment(messages)
-        for problem in problems:
-            print(problem)
-        print(f"{len(messages)} messages checked, {len(problems)} problems")
-        return 1 if problems else 0
+    for iface in root["interfaces"]:
+        p = _macro_prefix(iface["name"])
+        out.append(f"// {iface['name']} v{iface['version']}")
+        out.append(f"#define {p}_VERSION {iface['version']}")
+        out.append(f"#define {p}_NAME \"{iface['name']}\"")
+        for msg in iface.get("requests", []) or []:
+            out.append(f"#define {p}_REQ_{msg['name'].upper()} {msg['opcode']}")
+        for msg in iface.get("events", []) or []:
+            out.append(f"#define {p}_EVT_{msg['name'].upper()} {msg['opcode']}")
+        for ename, symbols in (iface.get("enums") or {}).items():
+            cename = _c_enum_name(iface["name"], ename).upper()
+            out.append(f"enum {cename.lower()} {{")
+            for value, sym in enumerate(symbols):
+                out.append(f"    {cename}_{sym.upper().replace('-', '_')} = {value},")
+            out.append("};")
+        out.append("")
 
-    if args.lang == "c":
-        gen_c(idl, messages, Path(args.out or ROOT / "build" / "generated"))
+    out.append("#endif")
+    out.append("")
+    return "\n".join(out)
+
+
+def _ada_ident(s):
+    return s.replace("-", "_").upper()
+
+
+def cap(s):
+    # hello-world -> HelloWorld, used for ada identifiers
+    return "".join(part.capitalize() for part in s.replace("-", "_").split("_"))
+
+
+ARG_TYPE_IDS = {
+    "uint32": "X12_ARG_UINT32", "int32": "X12_ARG_INT32",
+    "uint64": "X12_ARG_UINT64", "int64": "X12_ARG_INT64",
+    "fixed24p8": "X12_ARG_FIXED24P8", "string": "X12_ARG_STRING",
+    "fd": "X12_ARG_FD", "object": "X12_ARG_OBJECT", "new_id": "X12_ARG_NEW_ID",
+    "array_u32": "X12_ARG_ARRAY_U32", "enum": "X12_ARG_ENUM",
+}
+
+
+def gen_tables_c(root):
+    # codec knowledge as pure data: the c engine walks these tables, so a
+    # protocol change never touches handwritten code
+    out = []
+    out.append("// Copyright (c) lezginskiy <xanother-x12@proton.me>")
+    out.append("// SPDX-License-Identifier: MIT")
+    out.append("//")
+    out.append("// generated from spec/x12-core.yaml by x12gen, do not edit")
+    out.append('#include "x12_wire.h"')
+    out.append("")
+
+    enums = collect_enums(root)
+    enum_index = {name: i for i, (name, _) in enumerate(enums)}
+    for idx, (name, symbols) in enumerate(enums):
+        out.append("static const char *const "
+                   f"x12_enum_syms_{idx}[] = {{ {', '.join(f'\"{s}\"' for s in symbols)} }};")
+    out.append("")
+    out.append("const x12_enum_desc x12_enums[] = {")
+    for idx, (name, symbols) in enumerate(enums):
+        out.append(f'    {{ "{name}", {len(symbols)}, x12_enum_syms_{idx} }},')
+    out.append("};")
+    out.append(f"const size_t x12_enums_count = {len(enums)};")
+    out.append("")
+
+    for iface in root["interfaces"]:
+        iname = iface["name"]
+        for kind_key in ("requests", "events"):
+            for msg in iface.get(kind_key, []) or []:
+                args = msg.get("args") or []
+                if not args:
+                    continue
+                out.append(f"static const x12_arg_desc args_{iname}_{msg['name']}[] = {{")
+                for arg in args:
+                    eid = 255
+                    if arg["type"] == "enum" or \
+                            (arg["type"] == "array_u32" and arg.get("of") != "uint32"):
+                        eid = enum_index.get(arg.get("of"), 255)
+                    out.append(f'    {{ "{arg["name"]}", {ARG_TYPE_IDS[arg["type"]]}, {eid} }},')
+                out.append("};")
+        out.append(f"static const x12_msg_desc msgs_{iname}[] = {{")
+        for kind_key, kind_const in (("requests", "X12_REQUEST"), ("events", "X12_EVENT")):
+            for msg in iface.get(kind_key, []) or []:
+                args = msg.get("args") or []
+                ref = f"args_{iname}_{msg['name']}" if args else "0"
+                out.append(f'    {{ "{msg["name"]}", {msg["opcode"]}, {kind_const}, '
+                           f'{len(args)}, {ref} }},')
+        out.append("};")
+        out.append("")
+
+    out.append("const x12_iface_desc x12_interfaces[] = {")
+    for iface in root["interfaces"]:
+        total = len(iface.get("requests") or []) + len(iface.get("events") or [])
+        out.append(f'    {{ "{iface["name"]}", {iface["version"]}, {total}, '
+                   f'msgs_{iface["name"]} }},')
+    out.append("};")
+    out.append(f"const size_t x12_interfaces_count = {len(root['interfaces'])};")
+    out.append("")
+    return "\n".join(out)
+
+
+def _ada_enum_parts(iname, ename):
+    # x12_ prefixed enums are global, others are scoped to the interface
+    if ename.startswith("x12_"):
+        return cap(ename[len("x12_"):]), ""
+    base = cap(iname[len("x12_"):] + "_" + ename)
+    return base, base + "_"
+
+
+def _resolve_enum_symbols(root, iface, enum_name):
+    # interface level enums shadow root level ones, none shadow each other today
+    symbols = (iface.get("enums") or {}).get(enum_name)
+    if symbols is None:
+        symbols = (root.get("enums") or {}).get(enum_name)
+    return symbols
+
+
+def gen_ada(root):
+    out = []
+    out.append("-- Copyright (c) lezginskiy <xanother-x12@proton.me>")
+    out.append("-- SPDX-License-Identifier: MIT")
+    out.append("--")
+    out.append("-- generated from spec/x12-core.yaml by x12gen, do not edit")
+    out.append("package X12_Protocol is")
+    out.append("")
+    out.append("   pragma Pure;")
+    out.append("")
+    proto = root["protocol"]
+    out.append(f"   Idl_Format : constant := {proto['idl_format']};")
+    out.append(f"   Core_Version : constant := {proto['core_version']};")
+    out.append("")
+
+    for ename, symbols in (root.get("enums") or {}).items():
+        ecap, prefix = _ada_enum_parts(None, ename)
+        out.append(f"   type {ecap} is")
+        literals = [prefix + cap(s) for s in symbols]
+        out.append("      (" + ",\n       ".join(literals) + ");")
+        pairs = ", ".join(f"{lit} => {v}" for v, lit in enumerate(literals))
+        out.append(f"   for {ecap} use ({pairs});")
+    out.append("")
+
+    for iface in root["interfaces"]:
+        short = iface["name"][len("x12_"):]
+        iface_cap = "".join(part.capitalize() for part in short.split("_"))
+        out.append(f"   -- {iface['name']} v{iface['version']}")
+        out.append(f"   {iface_cap}_Version : constant := {iface['version']};")
+        out.append(f"   {iface_cap}_Name : constant String := \"{iface['name']}\";")
+        for msg in iface.get("requests", []) or []:
+            out.append(f"   {iface_cap}_Req_{cap(msg['name'])}_Opcode : constant := {msg['opcode']};")
+        for msg in iface.get("events", []) or []:
+            out.append(f"   {iface_cap}_Evt_{cap(msg['name'])}_Opcode : constant := {msg['opcode']};")
+        for ename, symbols in (iface.get("enums") or {}).items():
+            ecap, prefix = _ada_enum_parts(iface["name"], ename)
+            out.append(f"   type {ecap} is")
+            literals = [prefix + cap(s) for s in symbols]
+            out.append("      (" + ",\n       ".join(literals) + ");")
+            pairs = ", ".join(f"{lit} => {v}" for v, lit in enumerate(literals))
+            out.append(f"   for {ecap} use ({pairs});")
+        out.append("")
+
+    out.append("end X12_Protocol;")
+    out.append("")
+    return "\n".join(out)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="x12 idl codegen")
+    ap.add_argument("--idl", default="spec/x12-core.yaml")
+    ap.add_argument("--out-dir", default="build/gen")
+    ap.add_argument("--lang", choices=["c", "ada", "check"], default="check")
+    args = ap.parse_args(argv)
+
+    root = load_idl(args.idl)
+    if args.lang == "check":
+        print(f"ok: {len(root['interfaces'])} interfaces valid")
         return 0
-    return 1
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if args.lang in ("c", "check"):
+        (out_dir / "x12_protocol.h").write_text(gen_c(root), encoding="utf-8")
+        (out_dir / "x12_tables.c").write_text(gen_tables_c(root), encoding="utf-8")
+    if args.lang in ("ada", "check"):
+        (out_dir / "x12_protocol.ads").write_text(gen_ada(root), encoding="utf-8")
+    print(f"generated {args.lang} into {out_dir}")
+    return 0
 
 
 if __name__ == "__main__":
