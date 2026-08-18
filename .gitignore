@@ -7,3 +7,6 @@ build/
 # editor noise
 *.swp
 *~
+
+# python cache
+__pycache__/
