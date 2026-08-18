@@ -113,6 +113,21 @@ const x12_msg_desc *x12_msg_find(const x12_iface_desc *iface, uint8_t kind, uint
     return 0;
 }
 
+const x12_msg_desc *x12_msg_find_name(const x12_iface_desc *iface, uint8_t kind, const char *name) {
+    for (uint16_t i = 0; i < iface->msg_count; i++) {
+        const x12_msg_desc *m = &iface->msgs[i];
+        if (m->kind == kind && strcmp(m->name, name) == 0) {
+            return m;
+        }
+    }
+    return 0;
+}
+
+void x12_header_peek(const uint8_t *buf, uint32_t *object_out, uint16_t *opcode_out) {
+    *object_out = rd_u32(buf + 4);
+    *opcode_out = rd_u16(buf + 8);
+}
+
 // validates one argument and returns its payload size, validation happens
 // here so the write pass can stay blind to value errors
 static int arg_size(const x12_arg_desc *ad, const x12_arg *a, size_t *out) {

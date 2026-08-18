@@ -66,6 +66,12 @@ extern const size_t x12_interfaces_count;
 
 const x12_iface_desc *x12_iface_find(const char *name);
 const x12_msg_desc *x12_msg_find(const x12_iface_desc *iface, uint8_t kind, uint16_t opcode);
+// name lookup for handlers that name their message the way the idl does
+const x12_msg_desc *x12_msg_find_name(const x12_iface_desc *iface, uint8_t kind, const char *name);
+
+// header fields of a frame the caller already located by size, cheap peek
+// for dispatch before the full decode
+void x12_header_peek(const uint8_t *buf, uint32_t *object_out, uint16_t *opcode_out);
 
 // a decoded or to be encoded argument, the active field follows the table
 // arg type: u64 for unsigned numerics, enums, object ids and fd slots,
