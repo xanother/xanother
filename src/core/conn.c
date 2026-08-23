@@ -172,8 +172,8 @@ int x12_conn_read(struct x12_conn *c,
         int *fds = (int *)CMSG_DATA(cm);
         size_t cnt = (cm->cmsg_len - CMSG_LEN(0)) / sizeof(int);
         for (size_t i = 0; i < cnt; i++) {
-            if (c->n_fds < X12_MAX_FDS) {
-                c->in_fds[c->n_fds++] = fds[i];
+            if (c->n_in_fds < X12_MAX_FDS) {
+                c->in_fds[c->n_in_fds++] = fds[i];
             } else {
                 close(fds[i]);
             }
