@@ -82,9 +82,8 @@ int x12_conn_error(struct x12_conn *c, uint32_t code, uint32_t object) {
 }
 
 void x12_conn_flush(struct x12_conn *c) {
-    if (c->dead) {
-        return;
-    }
+    // works even for a dead connection, the reap path sends the final
+    // error events before the fd goes away
     size_t off = 0;
     while (off < c->out_len) {
         ssize_t n;

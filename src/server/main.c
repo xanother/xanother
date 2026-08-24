@@ -123,6 +123,9 @@ int main(int argc, char **argv) {
                 }
             }
             if (c->dead) {
+                // the final error events go out before the fd goes away,
+                // a loud disconnect names its reason
+                x12_conn_flush(c);
                 close(c->fd);
                 c->fd = -1;
             }
@@ -133,6 +136,7 @@ int main(int argc, char **argv) {
                 x12_conn_flush(&conns[i]);
             }
             if (conns[i].dead && conns[i].fd >= 0) {
+                x12_conn_flush(&conns[i]);
                 close(conns[i].fd);
                 conns[i].fd = -1;
             }
