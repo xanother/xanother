@@ -11,6 +11,9 @@
 #define X12_MAX_ARGS 16
 #define X12_IO_BUF 65536
 
+// shm pool bytes mapped for one client at a time
+#define X12_POOL_LIMIT (256u * 1024u * 1024u)
+
 // well known ids for the singletons the server creates on connect, client
 // allocated ids start elsewhere and may not touch these
 #define X12_OBJ_ID_CONNECTION 1u

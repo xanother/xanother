@@ -8,6 +8,7 @@
 
 #include "x12_wire.h"
 #include "limits.h"
+#include "state.h"
 
 // object kinds the core skeleton knows, later parties hang their state
 // off these
@@ -18,6 +19,9 @@ enum x12_obj_kind {
     OBJ_CALLBACK,
     OBJ_COMPOSITOR,
     OBJ_BUFFER_MANAGER,
+    OBJ_SHM_POOL,
+    OBJ_BUFFER,
+    OBJ_SURFACE,
     OBJ_SEAT,
     OBJ_SCREENCOPY,
 };
@@ -25,6 +29,11 @@ enum x12_obj_kind {
 struct x12_object {
     enum x12_obj_kind kind;
     const x12_iface_desc *iface;
+    union {
+        struct x12_pool_state pool;
+        struct x12_buffer_state buffer;
+        struct x12_surface_state surface;
+    } as;
 };
 
 struct x12_objects {

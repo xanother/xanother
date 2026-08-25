@@ -19,6 +19,7 @@ int x12_objects_alloc(struct x12_objects *t, uint32_t id,
     if (t->slots[id].kind != OBJ_FREE) {
         return -1;
     }
+    memset(&t->slots[id], 0, sizeof t->slots[id]);
     t->slots[id].kind = kind;
     t->slots[id].iface = iface;
     return 0;

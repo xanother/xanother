@@ -23,12 +23,16 @@ struct x12_conn {
     size_t n_in_fds;
     int out_fds[X12_MAX_FDS];
     size_t n_out_fds;
-    // wire slots name an fd by its position in the whole connection
-    // stream, clients map them to a growing received list, so the
-    // counter never resets on flush
+    // wire slots name an fd by its index into the received fd list below,
+    // handlers take the descriptor out of the list when they consume it
     uint64_t out_fds_sent;
     uint32_t caps;
     uint32_t serial;
+    // shm pool bytes currently mapped for this client, new pools past the
+    // budget in limits.h are refused with out-of-memory
+    uint64_t pool_bytes;
+    // monotonic commit token minted by surface commits
+    uint64_t token;
     // backpressure verdict: an event that cannot fit the out buffer means
     // the client stopped reading, the server disconnects it loudly
     // instead of silently dropping events. the main loop reaps dead ones
@@ -59,6 +63,16 @@ void x12_conn_kill(struct x12_conn *c, const char *why);
 
 // monotonic serial counter for events that need one
 uint32_t x12_conn_next_serial(struct x12_conn *c);
+
+// monotonic commit token, one per surface commit
+uint64_t x12_conn_next_token(struct x12_conn *c);
+
+// takes the fd sitting at index in the received list and shifts the rest
+// down, fails when the slot is empty
+int x12_conn_take_fd(struct x12_conn *c, uint32_t index, int *out_fd);
+
+// closes every fd still parked on the connection, part of the reap path
+void x12_conn_release_fds(struct x12_conn *c);
 
 uint64_t x12_now_ns(void);
 

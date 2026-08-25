@@ -43,6 +43,33 @@ uint32_t x12_conn_next_serial(struct x12_conn *c) {
     return c->serial;
 }
 
+uint64_t x12_conn_next_token(struct x12_conn *c) {
+    c->token++;
+    return c->token;
+}
+
+int x12_conn_take_fd(struct x12_conn *c, uint32_t index, int *out_fd) {
+    if (index >= c->n_in_fds) {
+        return -1;
+    }
+    *out_fd = c->in_fds[index];
+    memmove(&c->in_fds[index], &c->in_fds[index + 1],
+            (c->n_in_fds - index - 1) * sizeof(int));
+    c->n_in_fds--;
+    return 0;
+}
+
+void x12_conn_release_fds(struct x12_conn *c) {
+    for (size_t i = 0; i < c->n_in_fds; i++) {
+        close(c->in_fds[i]);
+    }
+    c->n_in_fds = 0;
+    for (size_t i = 0; i < c->n_out_fds; i++) {
+        close(c->out_fds[i]);
+    }
+    c->n_out_fds = 0;
+}
+
 int x12_conn_event(struct x12_conn *c, const x12_iface_desc *iface,
                    const char *evt, uint32_t object,
                    const x12_arg *args, size_t nargs) {
