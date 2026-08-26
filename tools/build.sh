@@ -10,7 +10,7 @@ cd "$(dirname "$0")/.."
 
 python3 tools/x12gen.py --lang c --out-dir build/gen
 
-CFLAGS="-std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -I src/wire -I src/core -I build/gen"
+CFLAGS="-std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -I src/wire -I src/core -I build/gen"
 
 gcc $CFLAGS -o build/x12-server \
     src/server/main.c \
