@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 #include "x12_protocol.h"
+#include "frame.h"
 
 uint32_t x12_format_bpp(uint32_t format) {
     if (format == X12_FORMAT_XRGB8888 || format == X12_FORMAT_ARGB8888) {
@@ -122,6 +123,14 @@ void x12_buffer_destroy(struct x12_conn *c, uint32_t id) {
     struct x12_object *o = x12_objects_get(&c->objects, id);
     if (!o || o->kind != OBJ_BUFFER) {
         return;
+    }
+    // surfaces referencing the buffer drop the reference, the retire
+    // bookkeeping keeps the credit until its normal leave
+    for (uint32_t sid = 1; sid < X12_MAX_OBJECTS; sid++) {
+        struct x12_object *s = x12_objects_get(&c->objects, sid);
+        if (s && s->kind == OBJ_SURFACE) {
+            x12_frame_drop_buffer(c, &s->as.surface, id);
+        }
     }
     x12_objects_free(&c->objects, id);
 }

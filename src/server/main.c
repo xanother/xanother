@@ -17,6 +17,21 @@
 #include "conn.h"
 #include "dispatch.h"
 #include "limits.h"
+#include "buffer.h"
+#include "frame.h"
+
+// the reap path gives everything back: surfaces retire their buffers,
+// pools unmap and parked fds close before the socket goes away
+static void client_teardown(struct x12_conn *c) {
+    for (uint32_t id = 1; id < X12_MAX_OBJECTS; id++) {
+        struct x12_object *o = x12_objects_get(&c->objects, id);
+        if (o && o->kind == OBJ_SURFACE) {
+            x12_frame_destroy(c, &o->as.surface);
+        }
+    }
+    x12_buffers_teardown(c);
+    x12_conn_release_fds(c);
+}
 
 static volatile sig_atomic_t running = 1;
 
@@ -126,17 +141,23 @@ int main(int argc, char **argv) {
                 // the final error events go out before the fd goes away,
                 // a loud disconnect names its reason
                 x12_conn_flush(c);
+                client_teardown(c);
                 close(c->fd);
                 c->fd = -1;
             }
         }
-        // drain whatever queued while handlers were answering
+        // drain whatever queued while handlers were answering, and let
+        // fences that signaled between passes retire their frames
         for (size_t i = 0; i < X12_MAX_CLIENTS; i++) {
+            if (conns[i].fd >= 0) {
+                x12_frame_drain_client(&conns[i]);
+            }
             if (conns[i].fd >= 0 && conns[i].out_len > 0) {
                 x12_conn_flush(&conns[i]);
             }
             if (conns[i].dead && conns[i].fd >= 0) {
                 x12_conn_flush(&conns[i]);
+                client_teardown(&conns[i]);
                 close(conns[i].fd);
                 conns[i].fd = -1;
             }

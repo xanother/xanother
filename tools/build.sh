@@ -10,7 +10,7 @@ cd "$(dirname "$0")/.."
 
 python3 tools/x12gen.py --lang c --out-dir build/gen
 
-CFLAGS="-std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -I src/wire -I src/core -I build/gen"
+CFLAGS="-std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -I src/wire -I src/core -I src/frame -I build/gen"
 
 gcc $CFLAGS -o build/x12-server \
     src/server/main.c \
@@ -18,6 +18,8 @@ gcc $CFLAGS -o build/x12-server \
     src/core/objects.c \
     src/core/dispatch.c \
     src/core/handlers.c \
+    src/core/buffer.c \
+    src/frame/frame.c \
     src/wire/x12_wire.c \
     build/gen/x12_tables.c
 

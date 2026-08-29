@@ -7,11 +7,21 @@
 #include "conn.h"
 
 // handlers return 0 to keep the connection and -1 to drop it, protocol
-// errors are answered with error events before returning 0
+// errors are answered with error events naming the request target
 
-int x12_handle_connection(struct x12_conn *c, struct x12_object *o,
+int x12_handle_connection(struct x12_conn *c, uint32_t object,
                           const x12_msg_desc *msg, const x12_arg *args);
-int x12_handle_registry(struct x12_conn *c, struct x12_object *o,
+int x12_handle_registry(struct x12_conn *c, uint32_t object,
                         const x12_msg_desc *msg, const x12_arg *args);
+int x12_handle_compositor(struct x12_conn *c, uint32_t object,
+                          const x12_msg_desc *msg, const x12_arg *args);
+int x12_handle_buffer_manager(struct x12_conn *c, uint32_t object,
+                              const x12_msg_desc *msg, const x12_arg *args);
+int x12_handle_shm_pool(struct x12_conn *c, uint32_t object,
+                        const x12_msg_desc *msg, const x12_arg *args);
+int x12_handle_buffer(struct x12_conn *c, uint32_t object,
+                      const x12_msg_desc *msg, const x12_arg *args);
+int x12_handle_surface(struct x12_conn *c, uint32_t object,
+                       const x12_msg_desc *msg, const x12_arg *args);
 
 #endif

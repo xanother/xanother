@@ -34,9 +34,19 @@ int x12_dispatch(struct x12_conn *c, const uint8_t *frame, size_t len) {
 
     switch (o->kind) {
     case OBJ_CONNECTION:
-        return x12_handle_connection(c, o, msg, args);
+        return x12_handle_connection(c, object, msg, args);
     case OBJ_REGISTRY:
-        return x12_handle_registry(c, o, msg, args);
+        return x12_handle_registry(c, object, msg, args);
+    case OBJ_COMPOSITOR:
+        return x12_handle_compositor(c, object, msg, args);
+    case OBJ_BUFFER_MANAGER:
+        return x12_handle_buffer_manager(c, object, msg, args);
+    case OBJ_SHM_POOL:
+        return x12_handle_shm_pool(c, object, msg, args);
+    case OBJ_BUFFER:
+        return x12_handle_buffer(c, object, msg, args);
+    case OBJ_SURFACE:
+        return x12_handle_surface(c, object, msg, args);
     default:
         // no request handler lives on this kind yet
         x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
