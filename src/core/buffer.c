@@ -50,28 +50,6 @@ int x12_pool_create(struct x12_conn *c, uint32_t id, int fd, uint32_t size) {
     return 0;
 }
 
-int x12_pool_resize(struct x12_conn *c, uint32_t id, uint32_t size) {
-    struct x12_object *o = x12_objects_get(&c->objects, id);
-    if (!o || o->kind != OBJ_SHM_POOL) {
-        return X12_ERROR_CODE_INVALID_ID;
-    }
-    if (size == 0) {
-        return X12_ERROR_CODE_BAD_VALUE;
-    }
-    uint64_t grown = c->pool_bytes - o->as.pool.size + size;
-    if (grown > X12_POOL_LIMIT) {
-        return X12_ERROR_CODE_OUT_OF_MEMORY;
-    }
-    uint8_t *map = mremap(o->as.pool.map, o->as.pool.size, size, MREMAP_MAYMOVE);
-    if (map == MAP_FAILED) {
-        return X12_ERROR_CODE_OUT_OF_MEMORY;
-    }
-    o->as.pool.map = map;
-    o->as.pool.size = size;
-    c->pool_bytes = grown;
-    return 0;
-}
-
 void x12_pool_destroy(struct x12_conn *c, uint32_t id) {
     struct x12_object *o = x12_objects_get(&c->objects, id);
     if (!o || o->kind != OBJ_SHM_POOL) {

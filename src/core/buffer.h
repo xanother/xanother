@@ -15,9 +15,6 @@
 // maps fd as a pool of size bytes, the fd is consumed on success
 int x12_pool_create(struct x12_conn *c, uint32_t id, int fd, uint32_t size);
 
-// remaps the pool, buffers carved past the new size are refused later
-int x12_pool_resize(struct x12_conn *c, uint32_t id, uint32_t size);
-
 // frees the mapping and every buffer carved out of it
 void x12_pool_destroy(struct x12_conn *c, uint32_t id);
 

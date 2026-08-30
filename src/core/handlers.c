@@ -211,13 +211,6 @@ int x12_handle_shm_pool(struct x12_conn *c, uint32_t object,
         x12_pool_destroy(c, object);
         return 0;
     }
-    if (strcmp(msg->name, "resize") == 0) {
-        int rc = x12_pool_resize(c, object, (uint32_t)args[0].u64);
-        if (rc != 0) {
-            x12_conn_error(c, (uint32_t)rc, object);
-        }
-        return 0;
-    }
     x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
     return 0;
 }

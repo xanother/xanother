@@ -42,11 +42,19 @@ class Session:
     def close(self):
         self.sock.close()
 
-    def send_raw(self, data):
-        self.sock.sendall(data)
+    def send_raw(self, data, fds=()):
+        if not fds:
+            self.sock.sendall(data)
+            return
+        # descriptors ride along in scm rights, the wire slot in the
+        # message names them by their index in the received list
+        anc = [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                struct.pack(f"{len(fds)}i", *fds))]
+        self.sock.sendmsg([data], anc)
 
-    def request(self, iface, msg, object_id, **args):
-        self.send_raw(wm.encode_request(self.idl, iface, msg, object_id=object_id, **args))
+    def request(self, iface, msg, object_id, fds=(), **args):
+        self.send_raw(wm.encode_request(self.idl, iface, msg,
+                                        object_id=object_id, **args), fds)
 
     def register(self, iface, id):
         self.ifaces[id] = iface
