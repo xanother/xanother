@@ -16,6 +16,13 @@ struct x12_rect {
     uint32_t w, h;
 };
 
+// view rect of a surface on the canvas in logical coordinates, roles
+// drive the origin later, the reference pass anchors at the origin
+struct x12_view {
+    int32_t x, y;
+    uint32_t w, h;
+};
+
 // rect list capacity per surface, overflow degrades to full surface
 #define X12_MAX_DAMAGE 8
 
@@ -75,10 +82,13 @@ struct x12_surface_state {
     // current state is what the compositor pass reads
     struct x12_bufref current;
     int has_current;
+    int has_frame;  // a commit happened, the frame on screen retires once
     struct x12_rect current_damage[X12_MAX_DAMAGE];
     int n_current_damage;
     uint32_t current_scale, current_transform, current_sync;
     int fence;  // guard of the current frame, -1 = none
+    uint32_t current_cbs[X12_MAX_CBS];
+    uint8_t n_current_cbs;
 
     // retired frames in commit order, the front one leaves first
     struct x12_retire retire[X12_MAX_RETIRE];
