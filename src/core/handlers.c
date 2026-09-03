@@ -9,6 +9,7 @@
 #include "x12_protocol.h"
 #include "buffer.h"
 #include "frame.h"
+#include "compositor.h"
 
 // bind rules: which global names the server advertises and which
 // capability it takes to bind them. the gate refuses loudly, a refused
@@ -233,6 +234,8 @@ int x12_handle_surface(struct x12_conn *c, uint32_t object,
     if (strcmp(msg->name, "destroy") == 0) {
         x12_frame_destroy(c, s);
         x12_objects_free(&c->objects, object);
+        // the pixels it showed are gone, the area needs a repaint
+        x12_comp_full_damage();
         return 0;
     }
     if (strcmp(msg->name, "set_buffer") == 0) {
@@ -276,6 +279,11 @@ int x12_handle_surface(struct x12_conn *c, uint32_t object,
             return -1;
         }
         x12_frame_drain(c, s);
+        // an unmap commit takes pixels off the canvas, the area needs a
+        // repaint the damage accounting cannot see
+        if (!s->has_current) {
+            x12_comp_full_damage();
+        }
         return 0;
     }
     if (strcmp(msg->name, "set_commit_fence") == 0) {

@@ -19,6 +19,8 @@
 #include "limits.h"
 #include "buffer.h"
 #include "frame.h"
+#include "compositor.h"
+#include "backend.h"
 
 // the reap path gives everything back: surfaces retire their buffers,
 // pools unmap and parked fds close before the socket goes away
@@ -72,7 +74,16 @@ int main(int argc, char **argv) {
         perror("socket");
         return 1;
     }
-    fprintf(stderr, "x12-server: listening on %s\n", sock_path);
+    if (x12_backend.init(argc, argv) != 0) {
+        fprintf(stderr, "x12-server: bad backend arguments\n");
+        close(srv);
+        return 1;
+    }
+    uint32_t canvas_w = 0, canvas_h = 0;
+    x12_backend.get_size(&canvas_w, &canvas_h);
+    x12_comp_set_size(canvas_w, canvas_h);
+    fprintf(stderr, "x12-server: listening on %s, canvas %ux%u\n",
+            sock_path, canvas_w, canvas_h);
 
     struct x12_conn conns[X12_MAX_CLIENTS];
     for (size_t i = 0; i < X12_MAX_CLIENTS; i++) {
@@ -103,6 +114,9 @@ int main(int argc, char **argv) {
                 continue;
             }
             perror("poll");
+            break;
+        }
+        if (x12_backend.halt_requested()) {
             break;
         }
 
@@ -162,6 +176,10 @@ int main(int argc, char **argv) {
                 conns[i].fd = -1;
             }
         }
+        // the composite pass repaints whatever the commits damaged, one
+        // pass per loop round keeps the damage accounting single writer
+        x12_comp_pass(conns, X12_MAX_CLIENTS);
+        x12_backend.pump();
     }
 
     for (size_t i = 0; i < X12_MAX_CLIENTS; i++) {
@@ -169,6 +187,7 @@ int main(int argc, char **argv) {
             close(conns[i].fd);
         }
     }
+    x12_backend.shutdown();
     close(srv);
     unlink(sock_path);
     fprintf(stderr, "x12-server: bye\n");
