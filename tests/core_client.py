@@ -14,8 +14,8 @@ from pathlib import Path
 from tests import wire_model as wm
 
 
-def spawn_server(binary, sock_path):
-    argv = [str(binary), str(sock_path)]
+def spawn_server(binary, sock_path, extra_args=()):
+    argv = [str(binary), str(sock_path)] + [str(a) for a in extra_args]
     Path(sock_path).unlink(missing_ok=True)
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     deadline = time.time() + 10

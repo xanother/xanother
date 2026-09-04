@@ -111,8 +111,8 @@ int x12_comp_pass(struct x12_conn *conns, size_t n) {
         clip.h = fb_h;
         damage_add(clip.x, clip.y, clip.w, clip.h);
     }
-    if (n_frame_damage == 0) {
-        full_damage = 0;
+    // nothing changed and nobody forced a repaint: the canvas is fine
+    if (!repaint_all && n_frame_damage == 0) {
         return 0;
     }
 
