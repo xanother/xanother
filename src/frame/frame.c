@@ -109,9 +109,12 @@ int x12_frame_commit(struct x12_conn *c, uint32_t surface_id,
                      struct x12_surface_state *s) {
     // the previous frame retires first, its credits leave through the
     // queue in commit order and the damage it accumulated goes with it
-    if (retire_current(c, s) != 0) {
-        return -1;
+    if (s->has_frame) {
+        if (retire_current(c, s) != 0) {
+            return -1;
+        }
     }
+    s->has_frame = 1;
     if (s->has_pending) {
         s->current = s->pending;
         s->has_current = s->current.object != 0;
@@ -236,7 +239,7 @@ void x12_frame_destroy(struct x12_conn *c, struct x12_surface_state *s) {
         }
         s->n_current_cbs = 0;
     }
-    if (retire_current(c, s) == 0) {
+    if (s->has_frame && retire_current(c, s) == 0) {
         s->retire[s->n_retire - 1].n_cbs = 0;
     }
     drain_force(c, s, 1);
