@@ -22,6 +22,9 @@ enum x12_obj_kind {
     OBJ_SHM_POOL,
     OBJ_BUFFER,
     OBJ_SURFACE,
+    OBJ_POSITIONER,
+    OBJ_TOPLEVEL,
+    OBJ_POPUP,
     OBJ_SEAT,
     OBJ_SCREENCOPY,
 };
@@ -33,6 +36,9 @@ struct x12_object {
         struct x12_pool_state pool;
         struct x12_buffer_state buffer;
         struct x12_surface_state surface;
+        struct x12_positioner_state positioner;
+        struct x12_toplevel_state toplevel;
+        struct x12_popup_state popup;
     } as;
 };
 

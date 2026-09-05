@@ -16,11 +16,17 @@ struct x12_rect {
     uint32_t w, h;
 };
 
-// view rect of a surface on the canvas in logical coordinates, roles
-// drive the origin later, the reference pass anchors at the origin
+// view rect of a surface on the canvas in logical coordinates
 struct x12_view {
     int32_t x, y;
     uint32_t w, h;
+};
+
+// role_kind values, 0 means the surface is never composited
+enum x12_role {
+    ROLE_NONE = 0,
+    ROLE_TOPLEVEL = 1,
+    ROLE_POPUP = 2,
 };
 
 // rect list capacity per surface, overflow degrades to full surface
@@ -93,6 +99,42 @@ struct x12_surface_state {
     // retired frames in commit order, the front one leaves first
     struct x12_retire retire[X12_MAX_RETIRE];
     uint8_t n_retire;
+
+    // window role, ROLE_NONE never reaches the canvas. role_id names the
+    // object holding the role state, it lives in this connection
+    uint32_t role_kind;
+    uint32_t role_id;
+};
+
+// placement description for popups, the popup copies the values at
+// create time and the positioner slot stays behind untouched
+struct x12_positioner_state {
+    int32_t rect_x, rect_y;
+    uint32_t rect_w, rect_h;
+    uint32_t anchor, gravity;  // x12_positioner.anchor_kind values
+    int32_t off_x, off_y;
+};
+
+struct x12_toplevel_state {
+    uint32_t surface_id;  // 0 = the surface died under the role
+    // configure serial bookkeeping: a commit maps the window only when
+    // the latest offer was acknowledged, anything else reoffered
+    uint32_t last_config, acked_config;
+    int fullscreen;
+    uint32_t min_w, min_h, max_w, max_h;
+    char title[128], app_id[128];
+};
+
+struct x12_popup_state {
+    uint32_t surface_id;   // 0 = the surface died under the role
+    uint32_t parent_id;    // parent surface, always a toplevel
+    // copy of the positioner values taken at create time
+    int32_t rect_x, rect_y;
+    uint32_t rect_w, rect_h;
+    uint32_t anchor, gravity;
+    int32_t off_x, off_y;
+    uint32_t last_config, acked_config;
+    int grabbed;  // armed by a valid grab, dismissal rides with input later
 };
 
 #endif
