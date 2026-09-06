@@ -20,6 +20,7 @@ gcc $CFLAGS -o build/x12-server \
     src/core/handlers.c \
     src/core/buffer.c \
     src/frame/frame.c \
+    src/frame/windows.c \
     src/frame/compositor.c \
     src/render/cpu.c \
     src/backend/backend_headless.c \
