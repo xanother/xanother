@@ -47,6 +47,12 @@ int x12_dispatch(struct x12_conn *c, const uint8_t *frame, size_t len) {
         return x12_handle_buffer(c, object, msg, args);
     case OBJ_SURFACE:
         return x12_handle_surface(c, object, msg, args);
+    case OBJ_POSITIONER:
+        return x12_handle_positioner(c, object, msg, args);
+    case OBJ_TOPLEVEL:
+        return x12_handle_toplevel(c, object, msg, args);
+    case OBJ_POPUP:
+        return x12_handle_popup(c, object, msg, args);
     default:
         // no request handler lives on this kind yet
         x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
