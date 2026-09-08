@@ -19,12 +19,14 @@
 #include "limits.h"
 #include "buffer.h"
 #include "frame.h"
+#include "windows.h"
 #include "compositor.h"
 #include "backend.h"
 
 // the reap path gives everything back: surfaces retire their buffers,
 // pools unmap and parked fds close before the socket goes away
 static void client_teardown(struct x12_conn *c) {
+    x12_windows_remove_client(c);
     for (uint32_t id = 1; id < X12_MAX_OBJECTS; id++) {
         struct x12_object *o = x12_objects_get(&c->objects, id);
         if (o && o->kind == OBJ_SURFACE) {
@@ -82,6 +84,8 @@ int main(int argc, char **argv) {
     uint32_t canvas_w = 0, canvas_h = 0;
     x12_backend.get_size(&canvas_w, &canvas_h);
     x12_comp_set_size(canvas_w, canvas_h);
+    x12_windows_init();
+    x12_windows_set_output(canvas_w, canvas_h);
     fprintf(stderr, "x12-server: listening on %s, canvas %ux%u\n",
             sock_path, canvas_w, canvas_h);
 
