@@ -39,6 +39,31 @@ def bind(s, name, version, id):
     s.register(name, id)
 
 
+def wait_configure(s, role_id):
+    # configure events for other roles are not under test here
+    while True:
+        ev = s.next_event()
+        if ev["name"] == "configure" and ev["object"] == role_id:
+            return ev
+
+
+def role_up(s, role_id, surface_id):
+    # a surface composites only through a window role: the toplevel
+    # offer comes back as configure, the ack maps the window on commit.
+    # fullscreen pins the view at the origin so the pixel checks run on
+    # a small canvas without the cascade placement in the way
+    s.request("x12_compositor", "create_toplevel", 10, id=role_id,
+              surface=surface_id)
+    s.register("x12_toplevel", role_id)
+    ev = wait_configure(s, role_id)
+    s.request("x12_toplevel", "ack_configure", role_id,
+              serial=ev["args"]["serial"])
+    s.request("x12_toplevel", "set_fullscreen", role_id, state=1)
+    ev = wait_configure(s, role_id)
+    s.request("x12_toplevel", "ack_configure", role_id,
+              serial=ev["args"]["serial"])
+
+
 def read_ppm():
     # the server rewrites the dump every present, a partial read shows up
     # as a short split or a size mismatch and the caller retries
@@ -126,12 +151,14 @@ def main():
                       x=0, y=0, width=W, height=H)
             s.request("x12_surface", "commit", surface)
 
-        # phase 1: xrgb identity, the pattern lands pixel for pixel
+        # phase 1: xrgb identity, the pattern lands pixel for pixel. the
+        # window is fullscreen pinned so it sits at the origin
         pat = b"".join(struct.pack("<I", pattern(x, y))
                        for y in range(H) for x in range(W))
         put(21, 0, XR24, W, H, pat)
         s.request("x12_compositor", "create_surface", 10, id=30)
         s.register("x12_surface", 30)
+        role_up(s, 12, 30)
         commit(30, 21)
 
         def check_pattern(frame):
@@ -146,6 +173,7 @@ def main():
         put(22, 1, AR24, W, H, half_blue)
         s.request("x12_compositor", "create_surface", 10, id=31)
         s.register("x12_surface", 31)
+        role_up(s, 13, 31)
         commit(31, 22)
 
         def check_blend(frame):
