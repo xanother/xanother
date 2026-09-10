@@ -28,6 +28,13 @@ struct x12_conn {
     uint64_t out_fds_sent;
     uint32_t caps;
     uint32_t serial;
+    // seat objects this client bound, 0 means no device. one pointer
+    // and one keyboard per client, a second get refuses loudly
+    uint32_t pointer_id, keyboard_id;
+    // the cursor sprite the client set: a roleless surface drawn at the
+    // pointer minus the hotspot, 0 hides the sprite
+    uint32_t cursor_surface_id;
+    int32_t cursor_hot_x, cursor_hot_y;
     // shm pool bytes currently mapped for this client, new pools past the
     // budget in limits.h are refused with out-of-memory
     uint64_t pool_bytes;
@@ -54,6 +61,13 @@ void x12_conn_flush(struct x12_conn *c);
 int x12_conn_event(struct x12_conn *c, const x12_iface_desc *iface,
                    const char *evt, uint32_t object,
                    const x12_arg *args, size_t nargs);
+
+// like x12_conn_event but queues a real fd for scm rights delivery, the
+// arg at fd_arg_index receives the wire slot of the descriptor and the
+// flush is immediate so the fd travels with its event
+int x12_conn_event_fd(struct x12_conn *c, const x12_iface_desc *iface,
+                      const char *evt, uint32_t object, x12_arg *args,
+                      size_t nargs, size_t fd_arg_index, int fd);
 
 // protocol errors are per object events on the connection object
 int x12_conn_error(struct x12_conn *c, uint32_t code, uint32_t object);

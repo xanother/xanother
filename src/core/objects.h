@@ -25,6 +25,9 @@ enum x12_obj_kind {
     OBJ_POSITIONER,
     OBJ_TOPLEVEL,
     OBJ_POPUP,
+    OBJ_POINTER,
+    OBJ_KEYBOARD,
+    OBJ_TOUCH,
     OBJ_SEAT,
     OBJ_SCREENCOPY,
 };

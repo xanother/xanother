@@ -99,6 +99,28 @@ int x12_conn_event(struct x12_conn *c, const x12_iface_desc *iface,
     return 0;
 }
 
+int x12_conn_event_fd(struct x12_conn *c, const x12_iface_desc *iface,
+                      const char *evt, uint32_t object, x12_arg *args,
+                      size_t nargs, size_t fd_arg_index, int fd) {
+    if (c->n_out_fds >= X12_MAX_FDS) {
+        close(fd);
+        return -1;
+    }
+    // the wire slot names this fd by its position in the whole
+    // connection fd stream, the client maps it onto a growing received
+    // list; the counter never resets, a second fd event on the same
+    // connection must not collide with the first
+    args[fd_arg_index].u64 = c->out_fds_sent++;
+    c->out_fds[c->n_out_fds++] = fd;
+    if (x12_conn_event(c, iface, evt, object, args, nargs) != 0) {
+        c->n_out_fds--;
+        close(fd);
+        return -1;
+    }
+    x12_conn_flush(c);
+    return 0;
+}
+
 int x12_conn_error(struct x12_conn *c, uint32_t code, uint32_t object) {
     x12_arg args[2] = {
         { .u64 = code },
