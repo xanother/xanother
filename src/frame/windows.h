@@ -61,4 +61,12 @@ void x12_windows_place_popup(int32_t rect_x, int32_t rect_y,
                              const struct x12_winview *parent,
                              int32_t *x, int32_t *y);
 
+// topmost view containing the point, popups win over toplevels because
+// they sit higher in the array. -1 means background
+int x12_windows_top_at(int32_t x, int32_t y);
+
+// a focus change raises the toplevel above its peers, popups always
+// stay above every toplevel
+void x12_windows_raise_toplevel(int idx);
+
 #endif

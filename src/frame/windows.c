@@ -88,6 +88,43 @@ int x12_windows_find(struct x12_conn *c, uint32_t surface_id) {
     return -1;
 }
 
+int x12_windows_top_at(int32_t x, int32_t y) {
+    for (int i = n_views - 1; i >= 0; i--) {
+        const struct x12_winview *v = &views[i];
+        if (!v->used) {
+            continue;
+        }
+        if (x >= v->x && y >= v->y &&
+            (uint32_t)(x - v->x) < v->width &&
+            (uint32_t)(y - v->y) < v->height) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+void x12_windows_raise_toplevel(int idx) {
+    if (idx < 0 || idx >= n_views || views[idx].is_popup) {
+        return;
+    }
+    // find the last toplevel slot, popups always stay above every toplevel
+    int last_top = -1;
+    for (int i = 0; i < n_views; i++) {
+        if (views[i].used && !views[i].is_popup) {
+            last_top = i;
+        }
+    }
+    if (last_top < 0 || last_top == idx) {
+        return;
+    }
+    struct x12_winview moved = views[idx];
+    for (int i = idx; i < last_top; i++) {
+        views[i] = views[i + 1];
+    }
+    views[last_top] = moved;
+    mark_dirty();
+}
+
 // removal closes the gap so the array order stays the z order
 void x12_windows_remove(int idx) {
     if (idx < 0 || idx >= n_views) {
