@@ -85,7 +85,7 @@ static int pop(struct x12_input_event *e) {
 
 // table lookup against the generated tables, the idl order is the value
 // order so the router never hardcodes wire numbers
-static int enum_value(const char *ename, const char *symbol, uint32_t *out) {
+int x12_input_enum(const char *ename, const char *symbol, uint32_t *out) {
     for (size_t i = 0; i < x12_enums_count; i++) {
         const x12_enum_desc *e = &x12_enums[i];
         if (strcmp(e->name, ename) != 0) {
@@ -108,10 +108,10 @@ static void resolve_tables(void) {
     if_pointer = x12_iface_find("x12_pointer");
     if_keyboard = x12_iface_find("x12_keyboard");
     if_popup = x12_iface_find("x12_popup");
-    if (enum_value("button_state", "pressed", &st_pressed) != 0 ||
-        enum_value("button_state", "released", &st_released) != 0 ||
-        enum_value("axis_kind", "vertical-scroll", &ax_v) != 0 ||
-        enum_value("axis_kind", "horizontal-scroll", &ax_h) != 0) {
+    if (x12_input_enum("button_state", "pressed", &st_pressed) != 0 ||
+        x12_input_enum("button_state", "released", &st_released) != 0 ||
+        x12_input_enum("axis_kind", "vertical-scroll", &ax_v) != 0 ||
+        x12_input_enum("axis_kind", "horizontal-scroll", &ax_h) != 0) {
         // missing tables are a build defect, the router degrades to silence
         if_pointer = if_keyboard = if_popup = 0;
     }

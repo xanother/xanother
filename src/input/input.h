@@ -55,4 +55,8 @@ int x12_input_serial_valid(struct x12_conn *c, uint32_t serial);
 // it (grab target while a grab is armed), null means background
 void x12_input_pointer(int32_t *x, int32_t *y, struct x12_conn **c);
 
+// wire enum values from the generated tables, the idl order is the
+// value order so no module hardcodes wire numbers
+int x12_input_enum(const char *ename, const char *symbol, uint32_t *out);
+
 #endif
