@@ -11,6 +11,10 @@
 #include "frame.h"
 #include "compositor.h"
 #include "windows.h"
+#include "input.h"
+
+#include <sys/mman.h>
+#include <xkbcommon/xkbcommon.h>
 
 static void apply_role_after_commit(struct x12_conn *c, uint32_t surface_id,
                                     struct x12_surface_state *s);
@@ -150,6 +154,23 @@ static int handle_bind(struct x12_conn *c, uint32_t object, const x12_arg *args)
             if (x12_conn_event(c, bm, "format", id, f, 1) != 0) {
                 return -1;
             }
+        }
+    }
+    // a fresh seat announces what it serves: one bit per device_class
+    // value, pointer and keyboard, touch is wired protocol without a
+    // runtime so the bit stays off until get_touch stops refusing
+    if (rule->kind == OBJ_SEAT) {
+        const x12_iface_desc *is = x12_iface_find("x12_seat");
+        x12_arg cap[1] = { { .u64 = (1u << 0) | (1u << 1) } };
+        if (x12_conn_event(c, is, "capabilities", id, cap, 1) != 0) {
+            return -1;
+        }
+        const char *name = "x12-seat";
+        x12_arg nm[1] = {
+            { .str = name, .str_len = (uint32_t)strlen(name) },
+        };
+        if (x12_conn_event(c, is, "name", id, nm, 1) != 0) {
+            return -1;
         }
     }
     return 0;
@@ -397,6 +418,67 @@ int x12_handle_surface(struct x12_conn *c, uint32_t object,
     }
     x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
     return 0;
+}
+
+// server keyboard policy: the real compiled keymap and the repeat
+// parameters clients self apply, the server never re-sends key events
+#define X12_KEY_REPEAT_RATE 25
+#define X12_KEY_REPEAT_DELAY 600
+
+// compiles the default us keymap through libxkbcommon and hands it out
+// as a read only memfd, the client receives the exact bytes a real
+// keyboard model would ship
+static int make_keymap_fd(uint32_t *size_out) {
+    struct xkb_context *ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    if (!ctx) {
+        return -1;
+    }
+    struct xkb_rule_names names = { .rules = "evdev", .model = "pc105",
+                                    .layout = "us" };
+    struct xkb_keymap *km = xkb_keymap_new_from_names(ctx, &names,
+                                                      XKB_KEYMAP_COMPILE_NO_FLAGS);
+    if (!km) {
+        xkb_context_unref(ctx);
+        return -1;
+    }
+    const char *text = xkb_keymap_get_as_string(km, XKB_KEYMAP_FORMAT_TEXT_V1);
+    int fd = -1;
+    size_t len = text ? strlen(text) : 0;
+    if (len > 0) {
+        fd = memfd_create("x12-keymap", MFD_CLOEXEC);
+        if (fd >= 0) {
+            if (ftruncate(fd, (off_t)len) == 0 &&
+                write(fd, text, len) == (ssize_t)len) {
+                // the file offset is shared with the receiver
+                lseek(fd, 0, SEEK_SET);
+                *size_out = (uint32_t)len;
+            } else {
+                close(fd);
+                fd = -1;
+            }
+        }
+    }
+    xkb_keymap_unref(km);
+    xkb_context_unref(ctx);
+    return fd;
+}
+
+// keymap args follow the idl order: format, fd slot, size
+static void announce_keyboard(struct x12_conn *c, uint32_t kb_id) {
+    uint32_t ksize = 0;
+    int kfd = make_keymap_fd(&ksize);
+    if (kfd >= 0) {
+        uint32_t fmt = 0;
+        (void)x12_input_enum("keymap_format", "xkb-v1", &fmt);
+        x12_arg kargs[3] = { { .u64 = fmt }, { .u64 = 0 }, { .u64 = ksize } };
+        x12_conn_event_fd(c, x12_iface_find("x12_keyboard"), "keymap", kb_id,
+                          kargs, 3, 1, kfd);
+    }
+    x12_arg rargs[2] = {
+        { .u64 = X12_KEY_REPEAT_RATE }, { .u64 = X12_KEY_REPEAT_DELAY },
+    };
+    x12_conn_event(c, x12_iface_find("x12_keyboard"), "repeat_info", kb_id,
+                   rargs, 2);
 }
 
 // the logical size a surface occupies, the buffer carries scale times
@@ -683,9 +765,12 @@ int x12_handle_popup(struct x12_conn *c, uint32_t object,
     if (strcmp(msg->name, "grab") == 0) {
         // arming is what enables outside press dismissal. the serial
         // must be a button press this connection actually received, a
-        // grab cannot ride on an invented serial. input serials do not
-        // exist yet, so nothing can arm until input lands
-        x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
+        // grab cannot ride on an invented serial
+        if (!x12_input_serial_valid(c, (uint32_t)args[1].u64)) {
+            x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
+        } else {
+            x12_input_set_grab(c, pp->surface_id);
+        }
         return 0;
     }
     if (strcmp(msg->name, "ack_configure") == 0) {
@@ -705,6 +790,104 @@ int x12_handle_popup(struct x12_conn *c, uint32_t object,
             if (view >= 0) {
                 x12_windows_remove(view);
             }
+        }
+        x12_objects_free(&c->objects, object);
+        return 0;
+    }
+    x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
+    return 0;
+}
+
+int x12_handle_seat(struct x12_conn *c, uint32_t object,
+                    const x12_msg_desc *msg, const x12_arg *args) {
+    // one pointer and one keyboard per client for now, a second get_*
+    // returns a refusal rather than silently replacing the id
+    if (strcmp(msg->name, "get_pointer") == 0) {
+        uint32_t id = (uint32_t)args[0].u64;
+        if (c->pointer_id ||
+            x12_objects_alloc(&c->objects, id, OBJ_POINTER,
+                              x12_iface_find("x12_pointer")) != 0) {
+            x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
+        } else {
+            c->pointer_id = id;
+        }
+        return 0;
+    }
+    if (strcmp(msg->name, "get_keyboard") == 0) {
+        uint32_t id = (uint32_t)args[0].u64;
+        if (c->keyboard_id ||
+            x12_objects_alloc(&c->objects, id, OBJ_KEYBOARD,
+                              x12_iface_find("x12_keyboard")) != 0) {
+            x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
+        } else {
+            c->keyboard_id = id;
+            announce_keyboard(c, id);
+        }
+        return 0;
+    }
+    if (strcmp(msg->name, "get_touch") == 0) {
+        // touch is wired protocol without a runtime yet, a loud
+        // refusal beats a silent stub
+        x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
+        return 0;
+    }
+    if (strcmp(msg->name, "get_data_device") == 0) {
+        // the clipboard device lands with the data party
+        x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
+        return 0;
+    }
+    if (strcmp(msg->name, "release") == 0) {
+        x12_objects_free(&c->objects, object);
+        return 0;
+    }
+    x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
+    return 0;
+}
+
+int x12_handle_pointer(struct x12_conn *c, uint32_t object,
+                       const x12_msg_desc *msg, const x12_arg *args) {
+    if (strcmp(msg->name, "set_cursor") == 0) {
+        uint32_t surf = (uint32_t)args[1].u64;
+        if (surf == 0) {
+            // a null surface hides the sprite
+            c->cursor_surface_id = 0;
+            x12_windows_force_dirty();
+            return 0;
+        }
+        struct x12_object *o = x12_objects_get(&c->objects, surf);
+        if (!o || o->kind != OBJ_SURFACE) {
+            x12_conn_error(c, X12_ERROR_CODE_INVALID_ID, object);
+            return 0;
+        }
+        if (o->as.surface.role_kind != ROLE_NONE) {
+            // a cursor rides a roleless surface, roled ones are
+            // windows in the stack already
+            x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
+            return 0;
+        }
+        c->cursor_surface_id = surf;
+        c->cursor_hot_x = (int32_t)args[2].i64;
+        c->cursor_hot_y = (int32_t)args[3].i64;
+        x12_windows_force_dirty();
+        return 0;
+    }
+    if (strcmp(msg->name, "release") == 0) {
+        if (c->pointer_id == object) {
+            c->pointer_id = 0;
+        }
+        x12_objects_free(&c->objects, object);
+        return 0;
+    }
+    x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
+    return 0;
+}
+
+int x12_handle_keyboard(struct x12_conn *c, uint32_t object,
+                        const x12_msg_desc *msg, const x12_arg *args) {
+    (void)args;
+    if (strcmp(msg->name, "release") == 0) {
+        if (c->keyboard_id == object) {
+            c->keyboard_id = 0;
         }
         x12_objects_free(&c->objects, object);
         return 0;

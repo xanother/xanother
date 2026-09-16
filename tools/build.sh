@@ -10,7 +10,7 @@ cd "$(dirname "$0")/.."
 
 python3 tools/x12gen.py --lang c --out-dir build/gen
 
-CFLAGS="-std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -I src/wire -I src/core -I src/frame -I src/render -I src/backend -I build/gen"
+CFLAGS="-std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -I src/wire -I src/core -I src/frame -I src/render -I src/backend -I src/input -I build/gen"
 
 gcc $CFLAGS -o build/x12-server \
     src/server/main.c \
@@ -22,10 +22,14 @@ gcc $CFLAGS -o build/x12-server \
     src/frame/frame.c \
     src/frame/windows.c \
     src/frame/compositor.c \
+    src/input/input.c \
+    src/input/source_file.c \
+    src/input/source_evdev.c \
     src/render/cpu.c \
     src/backend/backend_headless.c \
     src/wire/x12_wire.c \
-    build/gen/x12_tables.c
+    build/gen/x12_tables.c \
+    -lxkbcommon
 
 gcc $CFLAGS -o build/c_roundtrip \
     tests/c_roundtrip.c \

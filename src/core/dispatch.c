@@ -53,6 +53,12 @@ int x12_dispatch(struct x12_conn *c, const uint8_t *frame, size_t len) {
         return x12_handle_toplevel(c, object, msg, args);
     case OBJ_POPUP:
         return x12_handle_popup(c, object, msg, args);
+    case OBJ_SEAT:
+        return x12_handle_seat(c, object, msg, args);
+    case OBJ_POINTER:
+        return x12_handle_pointer(c, object, msg, args);
+    case OBJ_KEYBOARD:
+        return x12_handle_keyboard(c, object, msg, args);
     default:
         // no request handler lives on this kind yet
         x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
