@@ -89,4 +89,5 @@ const struct x12_backend_ops x12_backend = {
     .pump = pump,
     .halt_requested = halt_requested,
     .shutdown = shutdown,
+    .host_cursor = 0,
 };

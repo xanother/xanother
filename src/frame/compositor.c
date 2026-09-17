@@ -4,10 +4,12 @@
 #include "compositor.h"
 
 #include <stdlib.h>
+#include <string.h>
 
 #include "backend.h"
 #include "cpu.h"
 #include "windows.h"
+#include "input.h"
 
 // damage rect capacity of one pass, overflow means full repaint so a
 // burst of small updates cannot drown the list
@@ -59,6 +61,36 @@ static void surface_view(const struct x12_bufref *ref, uint32_t scale,
     view->h = ref->height * 256 / scale;
 }
 
+// the pointer sprite: the hovered client's cursor surface drawn at the
+// pointer minus the hotspot. backends that draw a host cursor get no
+// sprite at all
+static struct x12_view sprite_last;
+static uint32_t sprite_last_sid;
+static int sprite_drawn;
+
+static int sprite_view(struct x12_view *view, struct x12_conn **owner,
+                       uint32_t *sid) {
+    if (x12_backend.host_cursor) {
+        return 0;
+    }
+    int32_t px, py;
+    struct x12_conn *cc;
+    x12_input_pointer(&px, &py, &cc);
+    if (!cc || !cc->cursor_surface_id) {
+        return 0;
+    }
+    struct x12_object *o =
+        x12_objects_get(&cc->objects, cc->cursor_surface_id);
+    if (!o || o->kind != OBJ_SURFACE || !o->as.surface.has_current) {
+        return 0;
+    }
+    surface_view(&o->as.surface.current, o->as.surface.current_scale,
+                 px - cc->cursor_hot_x, py - cc->cursor_hot_y, view);
+    *owner = cc;
+    *sid = cc->cursor_surface_id;
+    return 1;
+}
+
 int x12_comp_pass(struct x12_conn *conns, size_t n) {
     if (!fb) {
         return 0;
@@ -67,6 +99,26 @@ int x12_comp_pass(struct x12_conn *conns, size_t n) {
     // areas need a repaint the damage accounting cannot see
     if (x12_windows_take_dirty()) {
         full_damage = 1;
+    }
+    // the sprite moves with the pointer and repaints with the frames,
+    // the union of the old and the new rect is the cost of one move
+    struct x12_view sview;
+    struct x12_conn *sconn = 0;
+    uint32_t ssid = 0;
+    int have_sprite = sprite_view(&sview, &sconn, &ssid);
+    if (have_sprite != sprite_drawn ||
+        (have_sprite && (sview.x != sprite_last.x ||
+                         sview.y != sprite_last.y ||
+                         sview.w != sprite_last.w ||
+                         sview.h != sprite_last.h ||
+                         ssid != sprite_last_sid))) {
+        if (sprite_drawn) {
+            damage_add(sprite_last.x, sprite_last.y, sprite_last.w,
+                       sprite_last.h);
+        }
+        if (have_sprite) {
+            damage_add(sview.x, sview.y, sview.w, sview.h);
+        }
     }
     // collect: every surface gives up its damage to this pass, the
     // compositor is the only consumer so nothing accumulates twice
@@ -87,9 +139,22 @@ int x12_comp_pass(struct x12_conn *conns, size_t n) {
             }
             int vi = x12_windows_find(c, id);
             if (!s->has_current || vi < 0) {
-                // nothing on screen for this surface, roleless never
-                // composites and the map or unmap path already forced
-                // any repaint the stack needed
+                // the cursor sprite is roleless on purpose, its damage
+                // maps onto the sprite rect instead of the window stack
+                if (have_sprite && c == sconn && id == ssid) {
+                    if (s->n_current_damage < 0) {
+                        damage_add(sview.x, sview.y, sview.w, sview.h);
+                    } else {
+                        for (int k = 0; k < s->n_current_damage; k++) {
+                            const struct x12_rect *d = &s->current_damage[k];
+                            damage_add(sview.x + d->x, sview.y + d->y,
+                                       d->w, d->h);
+                        }
+                    }
+                }
+                // nothing else on screen for this surface, roleless
+                // never composites and the map or unmap path already
+                // forced any repaint the stack needed
                 s->n_current_damage = 0;
                 continue;
             }
@@ -142,8 +207,20 @@ int x12_comp_pass(struct x12_conn *conns, size_t n) {
             x12_cpu_blend_view(fb, fb_w, fb_h, &view, &s->current,
                                s->current_scale, &rects[k]);
         }
+        // the sprite rides on top of the whole stack
+        if (have_sprite) {
+            struct x12_object *o = x12_objects_get(&sconn->objects, ssid);
+            if (o && o->kind == OBJ_SURFACE && o->as.surface.has_current) {
+                x12_cpu_blend_view(fb, fb_w, fb_h, &sview,
+                                   &o->as.surface.current,
+                                   o->as.surface.current_scale, &rects[k]);
+            }
+        }
     }
     full_damage = 0;
+    sprite_last = sview;
+    sprite_last_sid = ssid;
+    sprite_drawn = have_sprite;
 
     x12_backend.present(fb, rects, n_rects);
     return 1;

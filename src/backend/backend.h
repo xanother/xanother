@@ -26,6 +26,9 @@ struct x12_backend_ops {
     // nonzero when the host asks the server to quit
     int (*halt_requested)(void);
     void (*shutdown)(void);
+    // nonzero when the host draws its own cursor (nested hosts), the
+    // compositor then renders no pointer sprite at all
+    int host_cursor;
 };
 
 extern const struct x12_backend_ops x12_backend;
