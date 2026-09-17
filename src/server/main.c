@@ -22,6 +22,8 @@
 #include "windows.h"
 #include "compositor.h"
 #include "backend.h"
+#include "input.h"
+#include "source.h"
 
 // the reap path gives everything back: surfaces retire their buffers,
 // pools unmap and parked fds close before the socket goes away
@@ -86,6 +88,26 @@ int main(int argc, char **argv) {
     x12_comp_set_size(canvas_w, canvas_h);
     x12_windows_init();
     x12_windows_set_output(canvas_w, canvas_h);
+
+    // input sources feed the router, --input opens the event line file
+    // and --evdev may repeat for every device node
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--input") == 0 && i + 1 < argc) {
+            i++;
+            if (x12_input_file_open(argv[i]) != 0) {
+                fprintf(stderr, "x12-server: cannot open input %s\n", argv[i]);
+                close(srv);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--evdev") == 0 && i + 1 < argc) {
+            i++;
+            if (x12_evdev_add(argv[i]) != 0) {
+                fprintf(stderr, "x12-server: cannot open evdev %s\n", argv[i]);
+                close(srv);
+                return 1;
+            }
+        }
+    }
     fprintf(stderr, "x12-server: listening on %s, canvas %ux%u\n",
             sock_path, canvas_w, canvas_h);
 
@@ -95,7 +117,7 @@ int main(int argc, char **argv) {
     }
 
     while (running) {
-        struct pollfd pfd[1 + X12_MAX_CLIENTS];
+        struct pollfd pfd[2 + X12_MAX_CLIENTS + X12_EVDEV_MAX];
         size_t slot_of[1 + X12_MAX_CLIENTS];
         pfd[0].fd = srv;
         pfd[0].events = POLLIN;
@@ -112,6 +134,12 @@ int main(int argc, char **argv) {
             slot_of[n] = i;
             n++;
         }
+        // input sources join the same poll round behind the clients
+        nfds_t n_clients = n;
+        int n_file = x12_input_file_fill(&pfd[n], 1);
+        n += (nfds_t)n_file;
+        int n_ev = x12_evdev_fill(&pfd[n], X12_EVDEV_MAX);
+        n += (nfds_t)n_ev;
         int rc = poll(pfd, n, 250);
         if (rc < 0) {
             if (errno == EINTR) {
@@ -143,7 +171,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        for (nfds_t k = 1; k < n; k++) {
+        for (nfds_t k = 1; k < n_clients; k++) {
             struct x12_conn *c = &conns[slot_of[k]];
             if (pfd[k].revents & (POLLERR | POLLHUP)) {
                 x12_conn_kill(c, "poll error");
@@ -180,6 +208,11 @@ int main(int argc, char **argv) {
                 conns[i].fd = -1;
             }
         }
+        // sources pump what arrived this round, the router turns it into
+        // seat events before the composite pass reads the pointer
+        x12_input_file_pump(&pfd[n_clients], n_file);
+        x12_evdev_pump(&pfd[n_clients + n_file], n_ev);
+        x12_input_dispatch();
         // the composite pass repaints whatever the commits damaged, one
         // pass per loop round keeps the damage accounting single writer
         x12_comp_pass(conns, X12_MAX_CLIENTS);

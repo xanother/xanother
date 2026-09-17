@@ -26,6 +26,8 @@ void x12_input_file_pump(const struct pollfd *pfds, int count);
 // evdev source: reads real devices and pushes the same events. relative
 // pointers accumulate between SYN REPORT batches the way evdev streams
 // them, absolute devices report their own range mapped onto the canvas
+#define X12_EVDEV_MAX 8
+
 int x12_evdev_add(const char *path);
 int x12_evdev_fill(struct pollfd *pfds, int max);
 void x12_evdev_pump(const struct pollfd *pfds, int count);

@@ -20,8 +20,6 @@
 #include "input.h"
 #include "windows.h"
 
-#define X12_EVDEV_MAX 8
-
 struct x12_evdev {
     int fd;
     // absolute devices report their own coordinate range, relative
