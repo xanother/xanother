@@ -100,6 +100,7 @@ int x12_comp_pass(struct x12_conn *conns, size_t n) {
     if (x12_windows_take_dirty()) {
         full_damage = 1;
     }
+    n_frame_damage = 0;
     // the sprite moves with the pointer and repaints with the frames,
     // the union of the old and the new rect is the cost of one move
     struct x12_view sview;
@@ -122,7 +123,6 @@ int x12_comp_pass(struct x12_conn *conns, size_t n) {
     }
     // collect: every surface gives up its damage to this pass, the
     // compositor is the only consumer so nothing accumulates twice
-    n_frame_damage = 0;
     for (size_t i = 0; i < n; i++) {
         struct x12_conn *c = &conns[i];
         if (c->fd < 0) {

@@ -38,6 +38,9 @@ class Session:
         self.sock.settimeout(5)
         self.buf = b""
         self.events = []
+        # descriptors the server shipped in scm rights, in arrival
+        # order; a message names its fd by index into this list
+        self.recv_fds = []
 
     def close(self):
         self.sock.close()
@@ -61,21 +64,28 @@ class Session:
 
     def _read_frame(self):
         while len(self.buf) < 12:
-            chunk = self.sock.recv(65536)
-            if not chunk:
-                raise AssertionError("server closed the connection")
-            self.buf += chunk
+            self._recv_more()
         (size,) = struct.unpack_from("<I", self.buf, 0)
         while len(self.buf) < size:
-            chunk = self.sock.recv(65536)
-            if not chunk:
-                raise AssertionError("server closed the connection")
-            self.buf += chunk
+            self._recv_more()
         frame, self.buf = self.buf[:size], self.buf[size:]
         (object_id,) = struct.unpack_from("<I", frame, 4)
         iface = self.ifaces.get(object_id)
         assert iface, f"event for unknown object {object_id}"
         return wm.decode(self.idl, iface, "event", frame)
+
+    def _recv_more(self):
+        # recvmsg so scm rights fds land in recv_fds instead of dying
+        # unread; plain recv silently drops them on linux
+        chunk, anc, _, _ = self.sock.recvmsg(65536, 256)
+        if not chunk:
+            raise AssertionError("server closed the connection")
+        self.buf += chunk
+        for level, typ, data in anc:
+            if level == socket.SOL_SOCKET and typ == socket.SCM_RIGHTS:
+                for off in range(0, len(data), 4):
+                    (fd,) = struct.unpack_from("<i", data, off)
+                    self.recv_fds.append(fd)
 
     def next_event(self):
         # returns the next event in arrival order
