@@ -36,4 +36,22 @@ gcc $CFLAGS -o build/c_roundtrip \
     src/wire/x12_wire.c \
     build/gen/x12_tables.c
 
+# client side: libx12 links the same wire engine the server speaks
+CLIENT="$CFLAGS -I client -I client/terminal"
+
+gcc $CLIENT -o build/welcome \
+    client/welcome.c \
+    client/libx12.c \
+    src/wire/x12_wire.c \
+    build/gen/x12_tables.c
+
+gcc $CLIENT -o build/x12-term \
+    client/terminal/x12-term.c \
+    client/terminal/term_grid.c \
+    client/terminal/term_vt.c \
+    client/libx12.c \
+    src/wire/x12_wire.c \
+    build/gen/x12_tables.c \
+    -lxkbcommon -lutil
+
 echo "build ok"
