@@ -588,7 +588,7 @@ int x12c_toplevel_map(x12c *c, uint32_t compositor_id, uint32_t surface_id) {
         x12c_call(c, "x12_surface", "commit", surface_id, 0, 0) != 0) {
         return -1;
     }
-    // the release of the committed buffer is the composited signal
+    // the release of the retired frame is the composited signal
     while (!c->got_release) {
         if (x12c_dispatch(c, 2000) <= 0) {
             return -1;

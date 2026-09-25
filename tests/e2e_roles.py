@@ -245,7 +245,8 @@ def main():
                     px(body, w, 70, 70) == GREEN)
         wait_pixels(check_no_toplevel, "toplevel gone, second window stays")
 
-        s.request("x12_surface", "commit", 27)  # no buffer: unmap
+        s.request("x12_surface", "set_buffer", 27, buffer=0)  # empty slot
+        s.request("x12_surface", "commit", 27)  # the next commit unmaps
 
         def check_unmap(frame):
             w, h, body = frame

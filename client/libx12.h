@@ -79,10 +79,12 @@ int x12c_buffer_create(x12c *c, uint32_t pool_id, size_t offset,
                        uint32_t width, uint32_t height, uint32_t format,
                        uint32_t *id_out, void *user);
 
-// toplevel handshake on a surface that already carries a committed
-// buffer: the configure offer, ack, commit; blocks in dispatch until the
-// server releases the buffer, meaning the frame is composited. returns
-// the created toplevel object id, later ack_configure must use it
+// toplevel handshake on a surface whose buffer slot already carries the
+// painted buffer: the configure offer, ack, commit. the slot is sticky
+// so the bare commit re-applies the buffer and maps the window. blocks
+// in dispatch until the server releases the retired frame, meaning the
+// map is composited. returns the created toplevel object id, later
+// ack_configure must use it
 int x12c_toplevel_map(x12c *c, uint32_t compositor_id, uint32_t surface_id);
 
 #endif

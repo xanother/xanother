@@ -115,6 +115,10 @@ int x12_frame_commit(struct x12_conn *c, uint32_t surface_id,
         }
     }
     s->has_frame = 1;
+    // the buffer slot is sticky: a commit re-applies it, only
+    // set_buffer(null) empties it and the next commit unmaps. a bare
+    // commit after a buffer commit therefore keeps the pixels, that is
+    // the damage-only repaint loop clients live on
     if (s->has_pending) {
         s->current = s->pending;
         s->has_current = s->current.object != 0;
@@ -135,8 +139,7 @@ int x12_frame_commit(struct x12_conn *c, uint32_t surface_id,
             }
         }
     } else {
-        // a commit with no pending buffer unmaps the surface, the damage
-        // already queued for the pass still belongs to the old pixels
+        // nothing ever sat in the slot, the surface never had pixels
         s->has_current = 0;
     }
     s->fence = s->pending_fence;
@@ -147,7 +150,6 @@ int x12_frame_commit(struct x12_conn *c, uint32_t surface_id,
     s->n_current_cbs = s->n_pending_cbs;
     s->n_pending_cbs = 0;
     s->n_pending_damage = 0;
-    s->has_pending = 0;
 
     // the token comes back as committed so present can name this exact
     // commit instead of a fresh serial
