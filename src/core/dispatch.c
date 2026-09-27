@@ -59,6 +59,12 @@ int x12_dispatch(struct x12_conn *c, const uint8_t *frame, size_t len) {
         return x12_handle_pointer(c, object, msg, args);
     case OBJ_KEYBOARD:
         return x12_handle_keyboard(c, object, msg, args);
+    case OBJ_DATA_DEVICE:
+        return x12_handle_data_device(c, object, msg, args);
+    case OBJ_DATA_SOURCE:
+        return x12_handle_data_source(c, object, msg, args);
+    case OBJ_DATA_OFFER:
+        return x12_handle_data_offer(c, object, msg, args);
     default:
         // no request handler lives on this kind yet
         x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);

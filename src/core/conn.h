@@ -31,6 +31,8 @@ struct x12_conn {
     // seat objects this client bound, 0 means no device. one pointer
     // and one keyboard per client, a second get refuses loudly
     uint32_t pointer_id, keyboard_id;
+    // the clipboard device, one per connection like the seat devices
+    uint32_t data_device_id;
     // the cursor sprite the client set: a roleless surface drawn at the
     // pointer minus the hotspot, 0 hides the sprite
     uint32_t cursor_surface_id;

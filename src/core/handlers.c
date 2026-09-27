@@ -12,6 +12,7 @@
 #include "compositor.h"
 #include "windows.h"
 #include "input.h"
+#include "selection.h"
 
 #include <sys/mman.h>
 #include <xkbcommon/xkbcommon.h>
@@ -832,8 +833,23 @@ int x12_handle_seat(struct x12_conn *c, uint32_t object,
         return 0;
     }
     if (strcmp(msg->name, "get_data_device") == 0) {
-        // the clipboard device lands with the data party
-        x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
+        uint32_t id = (uint32_t)args[0].u64;
+        if (c->data_device_id ||
+            x12_objects_alloc(&c->objects, id, OBJ_DATA_DEVICE,
+                              x12_iface_find("x12_data_device")) != 0) {
+            x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
+        } else {
+            c->data_device_id = id;
+            // the startup signals name the generation the device is
+            // joining, 0 means the connection saw no selection yet
+            const x12_iface_desc *dd = x12_iface_find("x12_data_device");
+            x12_arg gs[1] = { { .u64 = x12_selection_generation(0) } };
+            x12_arg gp[1] = { { .u64 = x12_selection_generation(1) } };
+            if (x12_conn_event(c, dd, "selection", id, gs, 1) != 0 ||
+                x12_conn_event(c, dd, "primary", id, gp, 1) != 0) {
+                return 0;
+            }
+        }
         return 0;
     }
     if (strcmp(msg->name, "release") == 0) {
@@ -889,6 +905,193 @@ int x12_handle_keyboard(struct x12_conn *c, uint32_t object,
         if (c->keyboard_id == object) {
             c->keyboard_id = 0;
         }
+        x12_objects_free(&c->objects, object);
+        return 0;
+    }
+    x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
+    return 0;
+}
+
+// the two selection slots the data device addresses, 0 is the clipboard
+// and 1 the primary
+static void selection_set(struct x12_conn *c, uint32_t device, int primary,
+                          uint32_t source) {
+    if (source == 0) {
+        struct x12_selection_change chg;
+        x12_selection_clear(primary, &chg);
+        x12_selection_after_change(&chg, primary, c, 0);
+        return;
+    }
+    struct x12_object *o = x12_objects_get(&c->objects, source);
+    if (!o || o->kind != OBJ_DATA_SOURCE) {
+        x12_conn_error(c, X12_ERROR_CODE_INVALID_ID, device);
+        return;
+    }
+    struct x12_selection_change chg;
+    x12_selection_claim(primary, c, source, &chg);
+    x12_selection_after_change(&chg, primary, c, source);
+}
+
+// the pull side: a fresh offer object replaying the owner mime list
+static void selection_get(struct x12_conn *c, uint32_t device, int primary,
+                          uint32_t id) {
+    struct x12_conn *owner;
+    uint32_t source_id;
+    x12_selection_owner(primary, &owner, &source_id);
+    if (!owner) {
+        // the idl refusal: no offer object into an empty selection
+        x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, device);
+        return;
+    }
+    if (x12_objects_alloc(&c->objects, id, OBJ_DATA_OFFER,
+                          x12_iface_find("x12_data_offer")) != 0) {
+        x12_conn_error(c, X12_ERROR_CODE_INVALID_ID, device);
+        return;
+    }
+    struct x12_object *o = x12_objects_get(&c->objects, id);
+    o->as.data_offer.primary = primary;
+    o->as.data_offer.generation = x12_selection_generation(primary);
+    struct x12_object *src = x12_objects_get(&owner->objects, source_id);
+    const x12_iface_desc *io = x12_iface_find("x12_data_offer");
+    for (uint32_t i = 0; src && i < src->as.data_source.n_mimes; i++) {
+        x12_arg m[1] = {
+            { .str = src->as.data_source.mimes[i],
+              .str_len = (uint32_t)strlen(src->as.data_source.mimes[i]) },
+        };
+        if (x12_conn_event(c, io, "offer", id, m, 1) != 0) {
+            return;
+        }
+    }
+}
+
+int x12_handle_data_device(struct x12_conn *c, uint32_t object,
+                           const x12_msg_desc *msg, const x12_arg *args) {
+    if (strcmp(msg->name, "set_selection") == 0) {
+        selection_set(c, object, 0, (uint32_t)args[0].u64);
+        return 0;
+    }
+    if (strcmp(msg->name, "set_primary") == 0) {
+        selection_set(c, object, 1, (uint32_t)args[0].u64);
+        return 0;
+    }
+    if (strcmp(msg->name, "get_selection") == 0) {
+        selection_get(c, object, 0, (uint32_t)args[0].u64);
+        return 0;
+    }
+    if (strcmp(msg->name, "get_primary") == 0) {
+        selection_get(c, object, 1, (uint32_t)args[0].u64);
+        return 0;
+    }
+    if (strcmp(msg->name, "create_source") == 0) {
+        if (x12_objects_alloc(&c->objects, (uint32_t)args[0].u64,
+                              OBJ_DATA_SOURCE,
+                              x12_iface_find("x12_data_source")) != 0) {
+            x12_conn_error(c, X12_ERROR_CODE_INVALID_ID, object);
+        }
+        return 0;
+    }
+    if (strcmp(msg->name, "release") == 0) {
+        if (c->data_device_id == object) {
+            c->data_device_id = 0;
+        }
+        x12_objects_free(&c->objects, object);
+        return 0;
+    }
+    x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
+    return 0;
+}
+
+int x12_handle_data_source(struct x12_conn *c, uint32_t object,
+                           const x12_msg_desc *msg, const x12_arg *args) {
+    struct x12_object *o = x12_objects_get(&c->objects, object);
+    if (strcmp(msg->name, "offer") == 0) {
+        uint32_t len = args[0].str_len;
+        struct x12_data_source_state *src = &o->as.data_source;
+        if (!len || len >= sizeof src->mimes[0]) {
+            x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
+            return 0;
+        }
+        int dup = 0;
+        for (uint32_t i = 0; i < src->n_mimes; i++) {
+            if (strcmp(src->mimes[i], args[0].str) == 0) {
+                dup = 1;
+                break;
+            }
+        }
+        // the fixed cap turns extra mimes into a loud refusal, a silent
+        // drop would promise the reader nothing while the list says
+        // otherwise
+        if (!dup && src->n_mimes >= 8) {
+            x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
+            return 0;
+        }
+        if (!dup) {
+            memcpy(src->mimes[src->n_mimes], args[0].str, len);
+            src->mimes[src->n_mimes][len] = 0;
+            src->n_mimes++;
+        }
+        return 0;
+    }
+    if (strcmp(msg->name, "destroy") == 0) {
+        // a source going away drops any slot it owned. the re-claim
+        // guard sees the very same source and skips the cancelled event
+        for (int primary = 0; primary < 2; primary++) {
+            struct x12_conn *owner;
+            uint32_t sid;
+            x12_selection_owner(primary, &owner, &sid);
+            if (owner == c && sid == object) {
+                struct x12_selection_change chg;
+                x12_selection_clear(primary, &chg);
+                x12_selection_after_change(&chg, primary, c, object);
+            }
+        }
+        x12_objects_free(&c->objects, object);
+        return 0;
+    }
+    x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
+    return 0;
+}
+
+int x12_handle_data_offer(struct x12_conn *c, uint32_t object,
+                          const x12_msg_desc *msg, const x12_arg *args) {
+    struct x12_object *o = x12_objects_get(&c->objects, object);
+    if (strcmp(msg->name, "receive") == 0) {
+        struct x12_conn *owner;
+        uint32_t sid;
+        x12_selection_owner(o->as.data_offer.primary, &owner, &sid);
+        if (!owner || o->as.data_offer.generation !=
+                          x12_selection_generation(o->as.data_offer.primary)) {
+            // stale or empty, the offer is finished already
+            x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
+            return 0;
+        }
+        struct x12_object *src = x12_objects_get(&owner->objects, sid);
+        int known = 0;
+        for (uint32_t i = 0; src && i < src->as.data_source.n_mimes; i++) {
+            if (strcmp(src->as.data_source.mimes[i], args[0].str) == 0) {
+                known = 1;
+                break;
+            }
+        }
+        int fd;
+        if (!known || x12_conn_take_fd(c, (uint32_t)args[1].u64, &fd) != 0) {
+            x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
+            return 0;
+        }
+        // the write end rides to the owner through scm rights, the
+        // reader keeps the other end of its own pipe; the flush closes
+        // our copy, the kernel holds the delivered one
+        x12_arg sargs[2] = {
+            { .str = args[0].str, .str_len = args[0].str_len },
+            { .u64 = 0 },
+        };
+        if (x12_conn_event_fd(owner, x12_iface_find("x12_data_source"),
+                              "send", sid, sargs, 2, 1, fd) != 0) {
+            x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
+        }
+        return 0;
+    }
+    if (strcmp(msg->name, "destroy") == 0) {
         x12_objects_free(&c->objects, object);
         return 0;
     }

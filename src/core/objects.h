@@ -30,6 +30,9 @@ enum x12_obj_kind {
     OBJ_TOUCH,
     OBJ_SEAT,
     OBJ_SCREENCOPY,
+    OBJ_DATA_DEVICE,
+    OBJ_DATA_SOURCE,
+    OBJ_DATA_OFFER,
 };
 
 struct x12_object {
@@ -42,6 +45,8 @@ struct x12_object {
         struct x12_positioner_state positioner;
         struct x12_toplevel_state toplevel;
         struct x12_popup_state popup;
+        struct x12_data_source_state data_source;
+        struct x12_data_offer_state data_offer;
     } as;
 };
 

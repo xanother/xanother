@@ -24,10 +24,14 @@
 #include "backend.h"
 #include "input.h"
 #include "source.h"
+#include "selection.h"
 
 // the reap path gives everything back: surfaces retire their buffers,
 // pools unmap and parked fds close before the socket goes away
 static void client_teardown(struct x12_conn *c) {
+    // a dying selection owner drops both slots, the readers learn the
+    // generation moved and their offers are finished
+    x12_selection_release_owner(c);
     x12_windows_remove_client(c);
     for (uint32_t id = 1; id < X12_MAX_OBJECTS; id++) {
         struct x12_object *o = x12_objects_get(&c->objects, id);
@@ -115,6 +119,7 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < X12_MAX_CLIENTS; i++) {
         conns[i].fd = -1;
     }
+    x12_selection_init(conns, X12_MAX_CLIENTS);
 
     while (running) {
         struct pollfd pfd[2 + X12_MAX_CLIENTS + X12_EVDEV_MAX];

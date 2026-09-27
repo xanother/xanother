@@ -35,5 +35,11 @@ int x12_handle_pointer(struct x12_conn *c, uint32_t object,
                        const x12_msg_desc *msg, const x12_arg *args);
 int x12_handle_keyboard(struct x12_conn *c, uint32_t object,
                         const x12_msg_desc *msg, const x12_arg *args);
+int x12_handle_data_device(struct x12_conn *c, uint32_t object,
+                           const x12_msg_desc *msg, const x12_arg *args);
+int x12_handle_data_source(struct x12_conn *c, uint32_t object,
+                           const x12_msg_desc *msg, const x12_arg *args);
+int x12_handle_data_offer(struct x12_conn *c, uint32_t object,
+                          const x12_msg_desc *msg, const x12_arg *args);
 
 #endif

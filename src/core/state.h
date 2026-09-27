@@ -137,4 +137,18 @@ struct x12_popup_state {
     int grabbed;  // armed by a valid grab, dismissal rides with input later
 };
 
+// clipboard content offered by one client: the mime list set through
+// offer requests before the source is ever claimed
+struct x12_data_source_state {
+    char mimes[8][128];
+    uint32_t n_mimes;
+};
+
+// a pull handle onto one selection generation, dead the moment the
+// generation moves
+struct x12_data_offer_state {
+    int primary;       // which slot it pins to
+    uint32_t generation;
+};
+
 #endif
