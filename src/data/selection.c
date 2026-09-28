@@ -147,10 +147,11 @@ void x12_selection_after_change(const struct x12_selection_change *chg,
 
 void x12_selection_release_owner(struct x12_conn *c) {
     for (int primary = 0; primary < X12_SELECTION_SLOTS; primary++) {
-        struct x12_conn *owner;
-        uint32_t sid;
-        x12_selection_owner(primary, &owner, &sid);
-        if (owner != c) {
+        int slot = primary ? 1 : 0;
+        // the raw slot is the truth here: by teardown time the conn is
+        // already marked dead and the liveness filtered read path
+        // would swear the slot has no owner
+        if (!sel[slot].active || sel[slot].owner != c) {
             continue;
         }
         struct x12_selection_change chg;

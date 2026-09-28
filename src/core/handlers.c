@@ -1056,16 +1056,18 @@ int x12_handle_data_offer(struct x12_conn *c, uint32_t object,
                           const x12_msg_desc *msg, const x12_arg *args) {
     struct x12_object *o = x12_objects_get(&c->objects, object);
     if (strcmp(msg->name, "receive") == 0) {
-        struct x12_conn *owner;
-        uint32_t sid;
-        x12_selection_owner(o->as.data_offer.primary, &owner, &sid);
-        if (!owner || o->as.data_offer.generation !=
-                          x12_selection_generation(o->as.data_offer.primary)) {
-            // stale or empty, the offer is finished already
+        // the fd is consumed first: a refused request must not leave its
+        // descriptor parked, the next one would name the wrong slot
+        int fd;
+        if (x12_conn_take_fd(c, (uint32_t)args[1].u64, &fd) != 0) {
             x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
             return 0;
         }
-        struct x12_object *src = x12_objects_get(&owner->objects, sid);
+        struct x12_conn *owner;
+        uint32_t sid;
+        x12_selection_owner(o->as.data_offer.primary, &owner, &sid);
+        struct x12_object *src =
+            owner ? x12_objects_get(&owner->objects, sid) : 0;
         int known = 0;
         for (uint32_t i = 0; src && i < src->as.data_source.n_mimes; i++) {
             if (strcmp(src->as.data_source.mimes[i], args[0].str) == 0) {
@@ -1073,8 +1075,11 @@ int x12_handle_data_offer(struct x12_conn *c, uint32_t object,
                 break;
             }
         }
-        int fd;
-        if (!known || x12_conn_take_fd(c, (uint32_t)args[1].u64, &fd) != 0) {
+        if (!owner || !known || o->as.data_offer.generation !=
+                                    x12_selection_generation(
+                                        o->as.data_offer.primary)) {
+            // stale or empty, the offer is finished already
+            close(fd);
             x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
             return 0;
         }
