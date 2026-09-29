@@ -233,13 +233,18 @@ int x12c_call(x12c *c, const char *iface_name, const char *request,
 int x12c_callfd(x12c *c, const char *iface_name, const char *request,
                 uint32_t object, x12_arg *args, size_t nargs,
                 size_t fd_arg, int fd) {
+    // the call owns the descriptor from here on, it is closed exactly
+    // once on every path. a caller close after this would race the fd
+    // number against the next open
     if (c->n_out_fds >= X12C_MAX_FDS) {
+        close(fd);
         return -1;
     }
     // the wire slot counts the ancillary queue, flushing per call keeps
     // slot and queue position in lockstep
     args[fd_arg].u64 = c->n_out_fds;
     if (encode_into(c, iface_name, request, object, args, nargs) != 0) {
+        close(fd);
         return -1;
     }
     c->out_fds[c->n_out_fds++] = fd;
@@ -539,8 +544,8 @@ int x12c_pool_create(x12c *c, uint32_t bufman_id, size_t size,
     x12_arg args[3] = { { .u64 = 0 }, { .u64 = size }, { .u64 = id } };
     if (x12c_callfd(c, "x12_buffer_manager", "create_shm_pool", bufman_id,
                     args, 3, 0, wire_fd) != 0) {
+        // callfd closed the wire copy already
         close(memfd);
-        close(wire_fd);
         return -1;
     }
     *id_out = id;

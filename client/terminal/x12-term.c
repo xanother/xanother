@@ -77,11 +77,17 @@ static uint32_t mouse_cx, mouse_cy;
 static int pend_scroll;
 static uint32_t sel_ax, sel_ay, sel_bx, sel_by;
 
-// the primary lives in the terminal until the selection protocol lands
-// with the data party: a copy fills sel_text and a middle click feeds it
-// back to the pty
+// selection transport: one data source object for the whole session,
+// the mime list is set once and re-copying just re-claims it as the
+// current primary. paste walks the pull model: get_primary, receive
+// into a pipe, the owner writes into the far end
+static uint32_t dd_id, src_id;
 static char sel_text[65536];
 static size_t sel_len;
+static int paste_state;
+static uint32_t paste_offer_id;
+static int paste_has_text;
+static int paste_pipe[2] = { -1, -1 };
 
 // keyboard model
 static struct xkb_context *kb_ctx;
@@ -516,19 +522,95 @@ static void sel_extract(void) {
     }
 }
 
-// a copy just re-extracts the rect, the primary buffer is local until
-// the selection protocol lands with the data party
+// one source object per session: the mime list never changes, a new
+// copy simply re-claims the same object as the current primary
 static void copy_to_primary(void) {
     sel_extract();
+    if (sel_len == 0) {
+        return;
+    }
+    if (src_id == 0) {
+        src_id = x12c_reserve(x12, "x12_data_source", 0);
+        if (!src_id ||
+            x12c_call(x12, "x12_data_device", "create_source", dd_id,
+                      (x12_arg[]) { { .u64 = src_id } }, 1) != 0) {
+            src_id = 0;
+            return;
+        }
+        x12_arg om[1] = { { .str = "text/plain", .str_len = 10 } };
+        if (x12c_call(x12, "x12_data_source", "offer", src_id, om, 1) != 0) {
+            return;
+        }
+    }
+    x12_arg ss[1] = { { .u64 = src_id } };
+    if (x12c_call(x12, "x12_data_device", "set_primary", dd_id, ss, 1) != 0) {
+        return;
+    }
 }
 
-static void paste_primary(void) {
+static void paste_cleanup(void) {
+    if (paste_pipe[0] >= 0) {
+        close(paste_pipe[0]);
+        paste_pipe[0] = -1;
+    }
+    paste_state = 0;
+    paste_has_text = 0;
+}
+
+static void paste_begin(void) {
     // pasting is input too, the view lands on the live bottom where
     // the echo will show up
     term_grid_view_home(&grid);
-    sel_extract();
-    if (sel_len > 0) {
-        write_all(sel_text, sel_len);
+    if (paste_state != 0) {
+        return;
+    }
+    paste_offer_id = x12c_reserve(x12, "x12_data_offer", 0);
+    if (!paste_offer_id) {
+        return;
+    }
+    if (pipe2(paste_pipe, O_NONBLOCK | O_CLOEXEC) != 0) {
+        paste_pipe[0] = paste_pipe[1] = -1;
+        return;
+    }
+    x12_arg gp[1] = { { .u64 = paste_offer_id } };
+    if (x12c_call(x12, "x12_data_device", "get_primary", dd_id, gp, 1) != 0) {
+        paste_cleanup();
+        return;
+    }
+    paste_state = 1;
+}
+
+// the mimes landed, hand the server our write end on the next pass
+static void paste_pump(void) {
+    if (paste_state == 1 && paste_has_text) {
+        x12_arg ra[2] = { { .str = "text/plain", .str_len = 10 },
+                          { .u64 = 0 } };
+        // callfd owns the write end from here on
+        int wfd = paste_pipe[1];
+        paste_pipe[1] = -1;
+        if (x12c_callfd(x12, "x12_data_offer", "receive", paste_offer_id,
+                        ra, 2, 1, wfd) != 0) {
+            paste_cleanup();
+            return;
+        }
+        paste_state = 2;
+    }
+    if (paste_state == 2) {
+        char chunk[4096];
+        ssize_t got;
+        int alive = 1;
+        while ((got = read(paste_pipe[0], chunk, sizeof chunk)) > 0) {
+            write_all(chunk, (size_t)got);
+        }
+        if (got == 0) {
+            // the owner wrote everything and closed, the paste is done
+            paste_cleanup();
+        } else if (got < 0 && errno != EAGAIN && errno != EINTR) {
+            alive = 0;
+        }
+        if (!alive) {
+            paste_cleanup();
+        }
     }
 }
 
@@ -638,7 +720,7 @@ static void on_event(x12c *c, const x12c_proxy *p, const x12_msg_desc *desc,
                     copy_to_primary();
                 }
             } else if (button == 2 && pressed) {
-                paste_primary();
+                paste_begin();
             }
         } else if (strcmp(desc->name, "axis") == 0 && nargs >= 2) {
             // fixed24p8 notches, positive turns the wheel down which
@@ -658,9 +740,50 @@ static void on_event(x12c *c, const x12c_proxy *p, const x12_msg_desc *desc,
         }
         return;
     }
+    if (strcmp(iface, "x12_data_source") == 0 && p->id == src_id) {
+        if (strcmp(desc->name, "send") == 0 && nargs >= 2) {
+            // the reader pipe write end arrived, push the selection out
+            int fd = (int)args[1].u64;
+            if (fd >= 0) {
+                size_t off = 0;
+                while (off < sel_len) {
+                    ssize_t w = write(fd, sel_text + off, sel_len - off);
+                    if (w <= 0) {
+                        if (w < 0 && errno == EINTR) {
+                            continue;
+                        }
+                        break;
+                    }
+                    off += (size_t)w;
+                }
+                close(fd);
+            }
+        } else if (strcmp(desc->name, "cancelled") == 0) {
+            // the primary moved on, the object stays allocated but
+            // worthless; a next copy starts a fresh source
+            src_id = 0;
+        }
+        return;
+    }
+    if (strcmp(iface, "x12_data_offer") == 0 && p->id == paste_offer_id) {
+        if (strcmp(desc->name, "offer") == 0 && nargs >= 1) {
+            if (args[0].str_len == 10 &&
+                memcmp(args[0].str, "text/plain", 10) == 0) {
+                paste_has_text = 1;
+            }
+        } else if (strcmp(desc->name, "finished") == 0) {
+            paste_offer_id = 0;
+        }
+        return;
+    }
     if (strcmp(desc->name, "error") == 0) {
         fprintf(stderr, "x12-term: server error on object %u\n",
                 (unsigned)args[1].u64);
+        // an empty primary refuses get_primary, the paste dies quietly
+        if ((unsigned)args[1].u64 == paste_offer_id && paste_state != 0) {
+            paste_offer_id = 0;
+            paste_cleanup();
+        }
     }
 }
 
@@ -754,6 +877,15 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // the clipboard device, the selection transport rides on it
+    dd_id = x12c_reserve(x12, "x12_data_device", 0);
+    x12_arg da[1] = { { .u64 = dd_id } };
+    if (!dd_id ||
+        x12c_call(x12, "x12_seat", "get_data_device", seat, da, 1) != 0) {
+        fprintf(stderr, "x12-term: data device refused\n");
+        return 1;
+    }
+
     surf_id = x12c_reserve(x12, "x12_surface", 0);
     x12_arg cr[1] = { { .u64 = surf_id } };
     if (!surf_id ||
@@ -825,11 +957,20 @@ int main(int argc, char **argv) {
     int exit_code = 0;
     int exited = 0;
     for (;;) {
-        struct pollfd pfds[3];
+        struct pollfd pfds[4];
         int n = 0;
         pfds[n++] = (struct pollfd){ x12c_fd(x12), POLLIN, 0 };
         pfds[n++] = (struct pollfd){ pty_fd, POLLIN, 0 };
         pfds[n++] = (struct pollfd){ selfpipe[0], POLLIN, 0 };
+        // the pipe rides in the poll set from the moment it exists, not
+        // from the moment pump reaches state 2: pfds is built before the
+        // pump call, a state-keyed check would skip the very iteration
+        // that arms the receive and the paste would sleep until any
+        // unrelated event woke the loop
+        if (paste_pipe[0] >= 0) {
+            pfds[n++] = (struct pollfd){ paste_pipe[0], POLLIN, 0 };
+        }
+        paste_pump();
         int timeout = -1;
         if (rpt.active) {
             timeout = (int)(rpt.next_ms - now_ms());

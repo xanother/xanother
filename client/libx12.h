@@ -61,7 +61,9 @@ int x12c_call(x12c *c, const char *iface_name, const char *request,
               uint32_t object, x12_arg *args, size_t nargs);
 
 // like call but queues one fd with the frame, the arg at fd_arg carries
-// the wire slot index; keymap events hand out real fds again
+// the wire slot index; keymap events hand out real fds again. the call
+// takes ownership of fd and closes it on every path, the caller must
+// not
 int x12c_callfd(x12c *c, const char *iface_name, const char *request,
                 uint32_t object, x12_arg *args, size_t nargs,
                 size_t fd_arg, int fd);
