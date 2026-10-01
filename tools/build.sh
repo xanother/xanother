@@ -27,15 +27,24 @@ gcc $CFLAGS -o build/x12-server \
     src/input/source_evdev.c \
     src/data/selection.c \
     src/render/cpu.c \
+    src/render/gpu.c \
     src/backend/backend_headless.c \
     src/wire/x12_wire.c \
     build/gen/x12_tables.c \
-    -lxkbcommon
+    -lxkbcommon -ldl
 
 gcc $CFLAGS -o build/c_roundtrip \
     tests/c_roundtrip.c \
     src/wire/x12_wire.c \
     build/gen/x12_tables.c
+
+# the gpu canvas contract: cpu and gpu blend paths must agree byte for
+# byte, the binary degrades to SKIP on a box without a gl stack
+gcc $CFLAGS -o build/c_gpu_contract \
+    tests/c_gpu_contract.c \
+    src/render/cpu.c \
+    src/render/gpu.c \
+    -ldl -lm
 
 # client side: libx12 links the same wire engine the server speaks
 CLIENT="$CFLAGS -I client -I client/terminal"
