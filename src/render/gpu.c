@@ -15,6 +15,14 @@
 #include <GLES3/gl3.h>
 #include <GLES3/gl3ext.h>
 
+#include <gbm.h>
+
+// 'ABGR', 'ARGB' and 'XRGB', the fourcc tags the bo and its gl import
+// share; raw values keep the build free of libdrm include paths
+#define X12_BO_ABGR8888 0x52474241u
+#define X12_BO_ARGB8888 0x42475241u
+#define X12_BO_XRGB8888 0x34325258u
+
 // the gl canvas engine: the composite pass blends client buffers into a
 // gpu canvas with the same integer premultiplied math the cpu path uses,
 // so pixels stay bit exact across both paths. every entry point resolves
@@ -111,6 +119,26 @@ X12_EGL_SYMS(X12_SYM_PTR)
 X12_GL_SYMS(X12_SYM_PTR)
 #undef X12_SYM_PTR
 
+#define X12_GBM_SYMS(X)                                                        \
+    X(p_gbm_create_device, "gbm_create_device", struct gbm_device *, (int))    \
+    X(p_gbm_device_destroy, "gbm_device_destroy", void,                        \
+      (struct gbm_device *))                                                   \
+    X(p_gbm_bo_create, "gbm_bo_create", struct gbm_bo *,                       \
+      (struct gbm_device *, uint32_t, uint32_t, uint32_t, uint32_t))           \
+    X(p_gbm_bo_get_fd, "gbm_bo_get_fd", int, (struct gbm_bo *))                \
+    X(p_gbm_bo_get_stride, "gbm_bo_get_stride", uint32_t, (struct gbm_bo *))   \
+    X(p_gbm_bo_destroy, "gbm_bo_destroy", void, (struct gbm_bo *))
+
+#define X12_SYM_PTR(name, raw, ret, params) static ret (*name) params;
+X12_GBM_SYMS(X12_SYM_PTR)
+#undef X12_SYM_PTR
+
+// older libgbm carries no modifier allocation, the plain create keeps
+// the present alive there
+static struct gbm_bo *(*p_gbm_bo_create_with_modifiers2)(
+    struct gbm_device *, uint32_t, uint32_t, uint32_t, const uint64_t *,
+    const unsigned int, uint32_t);
+
 // optional entry points: their absence degrades specific paths rather
 // than the engine
 static EGLImageKHR (*p_eglCreateImage)(EGLDisplay, EGLContext, EGLenum,
@@ -123,7 +151,9 @@ static EGLBoolean (*p_eglDestroyImage)(EGLDisplay, EGLImageKHR);
 typedef void (*x12_gl_image_tex2d)(GLenum, void *);
 static x12_gl_image_tex2d p_glEGLImageTargetTexture2DOES;
 
-static void *lib_egl, *lib_gl;
+static void *lib_egl, *lib_gl, *lib_gbm;
+static struct gbm_device *gbm_dev;
+static int gbm_fd = -1;
 static EGLDisplay dpy;
 static EGLContext ctx;
 static EGLSurface surf;
@@ -138,6 +168,18 @@ static GLuint fbo, copy_fbo;
 static GLint u_src, u_dst, u_rect_fill;
 static GLint u_copy_swap, u_copy_src, u_copy_rect;
 static uint32_t src_w_cur, src_h_cur;
+
+// one pair of scanout bos per present setup, the composite folds into
+// the back one and the backend flips it to the crtc
+struct x12_pres_bo {
+    struct gbm_bo *bo;
+    EGLImageKHR img;
+    GLuint tex;
+    uint32_t stride;
+    int swap;
+};
+static struct x12_pres_bo pres[2];
+static uint32_t pres_w, pres_h;
 
 static const char *vert_src =
     "#version 300 es\n"
@@ -293,6 +335,38 @@ static int resolve_syms(void) {
     return 1;
 }
 
+// the dma import hooks of the gbm present ride here, their absence
+// degrades the present to the cpu path only
+static int resolve_gbm(void) {
+    lib_gbm = dlopen("libgbm.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!lib_gbm) {
+        return 0;
+    }
+#define X12_SYM_LOAD_GBM(name, raw, ret, params)                               \
+    name = (ret(*)params)dlsym(lib_gbm, raw);                                  \
+    if (!name) {                                                               \
+        return 0;                                                              \
+    }
+    X12_GBM_SYMS(X12_SYM_LOAD_GBM)
+#undef X12_SYM_LOAD_GBM
+    p_gbm_bo_create_with_modifiers2 = (struct gbm_bo *(*)(
+        struct gbm_device *, uint32_t, uint32_t, uint32_t, const uint64_t *,
+        const unsigned int, uint32_t))dlsym(lib_gbm,
+                                            "gbm_bo_create_with_modifiers2");
+    p_eglCreateImage = (EGLImageKHR(*)(EGLDisplay, EGLContext, EGLenum,
+                                       EGLClientBuffer, const EGLint *))
+                           dlsym(lib_egl, "eglCreateImage");
+    p_eglCreateImageKHR = (EGLImageKHR(*)(EGLDisplay, EGLContext, EGLenum,
+                                          EGLClientBuffer, const EGLint *))
+                              p_eglGetProcAddress("eglCreateImageKHR");
+    p_eglDestroyImage = (EGLBoolean(*)(EGLDisplay, EGLImageKHR)) dlsym(
+        lib_egl, "eglDestroyImage");
+    p_glEGLImageTargetTexture2DOES =
+        (x12_gl_image_tex2d)p_eglGetProcAddress("glEGLImageTargetTexture2DOES");
+    return p_eglCreateImage && p_eglDestroyImage &&
+           p_glEGLImageTargetTexture2DOES;
+}
+
 // drives one display through config, context and make current, programs
 // included. any failure terminates the display, the caller tries its
 // next candidate
@@ -380,16 +454,39 @@ fail:
 }
 
 int x12_gpu_init(const char *node) {
-    (void)node;
     if (!resolve_syms()) {
         fprintf(stderr, "gpu engine: no usable gl stack, cpu blend path\n");
         return 0;
     }
-    // the surfaceless mesa platform is the headless path, no host
-    // display exists in a container
     PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform =
         (PFNEGLGETPLATFORMDISPLAYEXTPROC) p_eglGetProcAddress(
             "eglGetPlatformDisplayEXT");
+    // the gbm display of the render node puts the context on the same
+    // device the scanout bos allocate on, a foreign context would
+    // refuse their import; the surfaceless mesa display is the headless
+    // path and the fallback
+    if (node && resolve_gbm()) {
+        gbm_fd = open(node, O_RDWR | O_CLOEXEC);
+        if (gbm_fd >= 0) {
+            gbm_dev = p_gbm_create_device(gbm_fd);
+        }
+        if (gbm_dev && get_platform) {
+            dpy = get_platform(EGL_PLATFORM_GBM_MESA, gbm_dev, NULL);
+            if (dpy != EGL_NO_DISPLAY && build_context(dpy)) {
+                fprintf(stderr, "gpu engine: context on %s\n", node);
+                return 1;
+            }
+            dpy = EGL_NO_DISPLAY;
+        }
+        if (gbm_dev) {
+            p_gbm_device_destroy(gbm_dev);
+            gbm_dev = 0;
+        }
+        if (gbm_fd >= 0) {
+            close(gbm_fd);
+            gbm_fd = -1;
+        }
+    }
     if (get_platform) {
         dpy = get_platform(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY,
                            NULL);
@@ -407,6 +504,7 @@ void x12_gpu_shutdown(void) {
     if (!ready) {
         return;
     }
+    x12_gpu_present_shutdown();
     p_glDeleteRenderbuffers(1, &out_rb);
     p_glDeleteFramebuffers(1, &fbo);
     p_glDeleteFramebuffers(1, &copy_fbo);
@@ -418,6 +516,18 @@ void x12_gpu_shutdown(void) {
     p_glDeleteVertexArrays(1, &vao);
     p_eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     p_eglTerminate(dpy);
+    if (gbm_dev) {
+        p_gbm_device_destroy(gbm_dev);
+        gbm_dev = 0;
+    }
+    if (gbm_fd >= 0) {
+        close(gbm_fd);
+        gbm_fd = -1;
+    }
+    if (lib_gbm) {
+        dlclose(lib_gbm);
+        lib_gbm = 0;
+    }
     dlclose(lib_egl);
     dlclose(lib_gl);
     lib_egl = lib_gl = 0;
@@ -648,4 +758,160 @@ int x12_gpu_unorm_probe(uint8_t *out, uint32_t stride_bytes) {
     p_glDeleteFramebuffers(1, &fbo_probe);
     p_glDeleteRenderbuffers(1, &rb);
     return 1;
+}
+
+int x12_gpu_present_setup(uint32_t w, uint32_t h, int fds[2],
+                          uint32_t strides[2]) {
+    if (!ready || !gbm_dev || !w || !h || w > 8192 || h > 8192 ||
+        w != canvas_w || h != canvas_h) {
+        return 0;
+    }
+    // a fresh pair every call, the dma fds belong to the caller the
+    // moment the call succeeds and the engine never closes them
+    x12_gpu_present_shutdown();
+    for (int b = 0; b < 2; b++) {
+        struct x12_pres_bo *pb = &pres[b];
+        pb->swap = 0;
+        fds[b] = -1;
+        if (p_gbm_bo_create_with_modifiers2) {
+            pb->bo = p_gbm_bo_create_with_modifiers2(
+                gbm_dev, w, h, X12_BO_ABGR8888, NULL, 0,
+                GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING);
+        }
+        if (!pb->bo) {
+            pb->bo = p_gbm_bo_create(gbm_dev, w, h, GBM_BO_FORMAT_ARGB8888,
+                                     GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING);
+            pb->swap = 1;
+        }
+        if (!pb->bo) {
+            goto fail;
+        }
+        pb->stride = p_gbm_bo_get_stride(pb->bo);
+        int fd = p_gbm_bo_get_fd(pb->bo);
+        if (fd < 0) {
+            goto fail;
+        }
+        EGLint attrs[13] = {
+            EGL_WIDTH,
+            (EGLint)w,
+            EGL_HEIGHT,
+            (EGLint)h,
+            EGL_LINUX_DRM_FOURCC_EXT,
+            (EGLint)(pb->swap ? X12_BO_ARGB8888 : X12_BO_ABGR8888),
+            EGL_DMA_BUF_PLANE0_FD_EXT,
+            fd,
+            EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+            0,
+            EGL_DMA_BUF_PLANE0_PITCH_EXT,
+            (EGLint)pb->stride,
+            EGL_NONE,
+        };
+        // the khr hook goes first when present, some stacks return
+        // bad parameter through the 1.5 core path for attributes the
+        // same driver accepts through khr; a rejected alpha fourcc
+        // falls back to its xrgb twin, the memory layout is identical
+        // and the scanout fb carries no alpha anyway
+        EGLint fourcc_a[2] = {
+            (EGLint)(pb->swap ? X12_BO_ARGB8888 : X12_BO_ABGR8888),
+            (EGLint)X12_BO_XRGB8888,
+        };
+        for (int t = 0; t < 2 && pb->img == EGL_NO_IMAGE_KHR; t++) {
+            attrs[5] = fourcc_a[t];
+            if (p_eglCreateImageKHR) {
+                pb->img = p_eglCreateImageKHR(dpy, EGL_NO_CONTEXT,
+                                              EGL_LINUX_DMA_BUF_EXT, NULL,
+                                              attrs);
+            } else {
+                pb->img = p_eglCreateImage(dpy, EGL_NO_CONTEXT,
+                                           EGL_LINUX_DMA_BUF_EXT, NULL, attrs);
+            }
+        }
+        if (pb->img != EGL_NO_IMAGE_KHR) {
+            // egl takes a reference of its own and never closes the
+            // descriptor it was handed, the caller gets a fresh one
+            fds[b] = dup(fd);
+        }
+        close(fd);
+        if (pb->img == EGL_NO_IMAGE_KHR) {
+            goto fail;
+        }
+        p_glGenTextures(1, &pb->tex);
+        p_glBindTexture(GL_TEXTURE_2D, pb->tex);
+        p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        p_glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, pb->img);
+        strides[b] = pb->stride;
+    }
+    pres_w = w;
+    pres_h = h;
+    return 1;
+fail:
+    for (int b = 0; b < 2; b++) {
+        if (fds[b] >= 0) {
+            close(fds[b]);
+            fds[b] = -1;
+        }
+        if (pres[b].tex) {
+            p_glDeleteTextures(1, &pres[b].tex);
+            pres[b].tex = 0;
+        }
+        if (pres[b].img) {
+            p_eglDestroyImage(dpy, pres[b].img);
+            pres[b].img = 0;
+        }
+        if (pres[b].bo) {
+            p_gbm_bo_destroy(pres[b].bo);
+            pres[b].bo = 0;
+        }
+    }
+    pres_w = pres_h = 0;
+    return 0;
+}
+
+int x12_gpu_present_copy(int idx) {
+    if (!ready || idx < 0 || idx > 1 || !pres[idx].bo || !canvas_w ||
+        pres_w != canvas_w || pres_h != canvas_h) {
+        return 0;
+    }
+    p_glBindFramebuffer(GL_FRAMEBUFFER, copy_fbo);
+    p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                             GL_TEXTURE_2D, pres[idx].tex, 0);
+    unorm_draw(0);
+    // the page flip the backend arms reads the bo straight away, the
+    // pass must be on the hardware before the ioctl
+    p_glFinish();
+    return 1;
+}
+
+int x12_gpu_present_readback(int idx, uint8_t *out, uint32_t stride_bytes) {
+    if (!ready || idx < 0 || idx > 1 || !pres[idx].bo || !canvas_w) {
+        return 0;
+    }
+    p_glBindFramebuffer(GL_FRAMEBUFFER, copy_fbo);
+    p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                             GL_TEXTURE_2D, pres[idx].tex, 0);
+    for (uint32_t y = 0; y < canvas_h; y++) {
+        p_glReadPixels(0, (GLint)(canvas_h - 1 - y), (GLsizei)canvas_w, 1,
+                       GL_RGBA, GL_UNSIGNED_BYTE,
+                       out + (size_t)y * stride_bytes);
+    }
+    return 1;
+}
+
+void x12_gpu_present_shutdown(void) {
+    for (int b = 0; b < 2; b++) {
+        if (pres[b].tex) {
+            p_glDeleteTextures(1, &pres[b].tex);
+            pres[b].tex = 0;
+        }
+        if (pres[b].img) {
+            p_eglDestroyImage(dpy, pres[b].img);
+            pres[b].img = 0;
+        }
+        if (pres[b].bo) {
+            p_gbm_bo_destroy(pres[b].bo);
+            pres[b].bo = 0;
+        }
+    }
+    pres_w = pres_h = 0;
 }
