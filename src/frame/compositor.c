@@ -8,6 +8,7 @@
 
 #include "backend.h"
 #include "cpu.h"
+#include "gpu.h"
 #include "windows.h"
 #include "input.h"
 
@@ -188,12 +189,20 @@ int x12_comp_pass(struct x12_conn *conns, size_t n) {
     }
 
     // repaint: background first, then the window stack bottom to top,
-    // the array order is the z order the role machine maintains
+    // the array order is the z order the role machine maintains. the
+    // gpu path walks the same order on its canvas and pulls the rows
+    // the damage covers back into the cpu framebuffer afterwards, so
+    // the rest of the pipeline sees the same bytes either way
+    int gpu = x12_gpu_ready();
     const struct x12_rect *rects = repaint_all ? &clip : frame_damage;
     int n_rects = repaint_all ? 1 : n_frame_damage;
     int nw = x12_windows_count();
     for (int k = 0; k < n_rects; k++) {
-        x12_cpu_fill(fb, fb_w, fb_h, &rects[k], 0xFF000000u);
+        if (gpu) {
+            x12_gpu_fill(&rects[k], 1);
+        } else {
+            x12_cpu_fill(fb, fb_w, fb_h, &rects[k], 0xFF000000u);
+        }
         for (int i = 0; i < nw; i++) {
             const struct x12_winview *v = x12_windows_at(i);
             struct x12_object *o =
@@ -204,17 +213,40 @@ int x12_comp_pass(struct x12_conn *conns, size_t n) {
             struct x12_surface_state *s = &o->as.surface;
             struct x12_view view;
             surface_view(&s->current, s->current_scale, v->x, v->y, &view);
-            x12_cpu_blend_view(fb, fb_w, fb_h, &view, &s->current,
-                               s->current_scale, &rects[k]);
+            if (gpu) {
+                x12_gpu_blend(&view, &s->current, s->current_scale,
+                              &rects[k], 1);
+            } else {
+                x12_cpu_blend_view(fb, fb_w, fb_h, &view, &s->current,
+                                   s->current_scale, &rects[k]);
+            }
         }
         // the sprite rides on top of the whole stack
         if (have_sprite) {
             struct x12_object *o = x12_objects_get(&sconn->objects, ssid);
             if (o && o->kind == OBJ_SURFACE && o->as.surface.has_current) {
-                x12_cpu_blend_view(fb, fb_w, fb_h, &sview,
-                                   &o->as.surface.current,
-                                   o->as.surface.current_scale, &rects[k]);
+                if (gpu) {
+                    x12_gpu_blend(&sview, &o->as.surface.current,
+                                  o->as.surface.current_scale, &rects[k], 1);
+                } else {
+                    x12_cpu_blend_view(fb, fb_w, fb_h, &sview,
+                                       &o->as.surface.current,
+                                       o->as.surface.current_scale,
+                                       &rects[k]);
+                }
             }
+        }
+    }
+    if (gpu) {
+        // one band per damage rect, full width rows; outside the bands
+        // the framebuffer already mirrors the canvas from earlier passes
+        for (int k = 0; k < n_rects; k++) {
+            uint32_t y0 = rects[k].y < 0 ? 0 : (uint32_t)rects[k].y;
+            uint32_t y1 = (uint32_t)(rects[k].y + (int32_t)rects[k].h);
+            if (y1 > fb_h) {
+                y1 = fb_h;
+            }
+            x12_gpu_readback_band((uint8_t *)fb, fb_w * 4, y0, y1);
         }
     }
     full_damage = 0;

@@ -23,6 +23,7 @@
 #include "compositor.h"
 #include "backend.h"
 #include "input.h"
+#include "gpu.h"
 #include "source.h"
 #include "selection.h"
 
@@ -110,6 +111,29 @@ int main(int argc, char **argv) {
                 close(srv);
                 return 1;
             }
+        }
+    }
+
+    // --gpu blends through the gl canvas, --gpu-node puts the context
+    // on a render node so the gbm present can share its device. a gl
+    // stack that does not come up degrades to the cpu path, the server
+    // never dies over missing gpu support
+    int want_gpu = 0;
+    const char *gpu_node = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--gpu") == 0) {
+            want_gpu = 1;
+        } else if (strcmp(argv[i], "--gpu-node") == 0 && i + 1 < argc) {
+            want_gpu = 1;
+            gpu_node = argv[++i];
+        }
+    }
+    if (want_gpu) {
+        if (x12_gpu_init(gpu_node)) {
+            x12_gpu_canvas(canvas_w, canvas_h);
+            fprintf(stderr, "x12-server: gpu canvas active\n");
+        } else {
+            fprintf(stderr, "x12-server: gpu engine unavailable, cpu path\n");
         }
     }
     fprintf(stderr, "x12-server: listening on %s, canvas %ux%u\n",
@@ -229,6 +253,7 @@ int main(int argc, char **argv) {
             close(conns[i].fd);
         }
     }
+    x12_gpu_shutdown();
     x12_backend.shutdown();
     close(srv);
     unlink(sock_path);
