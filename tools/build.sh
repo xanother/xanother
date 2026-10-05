@@ -46,6 +46,14 @@ gcc $CFLAGS -o build/c_gpu_contract \
     src/render/gpu.c \
     -ldl -lm
 
+# the gbm present smoke: real render node or nothing, the dma path has
+# to land the canvas byte exact on both scanout bos
+gcc $CFLAGS -o build/c_gbm_present \
+    tests/c_gbm_present.c \
+    src/render/cpu.c \
+    src/render/gpu.c \
+    -ldl -lm
+
 # client side: libx12 links the same wire engine the server speaks
 CLIENT="$CFLAGS -I client -I client/terminal"
 
