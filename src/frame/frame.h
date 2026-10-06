@@ -44,6 +44,12 @@ void x12_frame_drain(struct x12_conn *c, struct x12_surface_state *s);
 // drain hook for the main loop, walks every surface of the client
 void x12_frame_drain_client(struct x12_conn *c);
 
+// the compositor stamps the frame it just pushed to the host with the
+// moment the display took it, the retire later reports it as the
+// scanout time in the output present feedback
+void x12_frame_presented(struct x12_conn *c, uint32_t surface_id,
+                         uint64_t ns);
+
 // surface death: outstanding releases go out now, fences close, frame
 // callbacks die silently since no frame will complete
 void x12_frame_destroy(struct x12_conn *c, struct x12_surface_state *s);

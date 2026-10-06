@@ -70,6 +70,12 @@ struct x12_retire {
     int fence;           // sync_file fd, -1 = always ready
     uint32_t cbs[X12_MAX_CBS];
     uint8_t n_cbs;
+    // presentation feedback: the token names this commit and shown_ns
+    // is the moment the display picked the frame up. the output present
+    // event carries both when the frame leaves
+    uint64_t token;
+    uint64_t shown_ns;
+    int shown;
 };
 
 struct x12_surface_state {
@@ -95,6 +101,11 @@ struct x12_surface_state {
     int fence;  // guard of the current frame, -1 = none
     uint32_t current_cbs[X12_MAX_CBS];
     uint8_t n_current_cbs;
+    // the commit token and the moment this frame reached the screen,
+    // both ride the present feedback when the frame leaves
+    uint64_t token;
+    uint64_t shown_ns;
+    int shown;
 
     // retired frames in commit order, the front one leaves first
     struct x12_retire retire[X12_MAX_RETIRE];

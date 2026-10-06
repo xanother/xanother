@@ -73,6 +73,14 @@ void x12_conn_release_fds(struct x12_conn *c) {
 int x12_conn_event(struct x12_conn *c, const x12_iface_desc *iface,
                    const char *evt, uint32_t object,
                    const x12_arg *args, size_t nargs) {
+    return x12_conn_event_ts(c, iface, evt, object, args, nargs, 0);
+}
+
+// ts zero means now; presentation feedback carries the real scanout
+// moment instead and must not be rewritten on the way out
+int x12_conn_event_ts(struct x12_conn *c, const x12_iface_desc *iface,
+                      const char *evt, uint32_t object,
+                      const x12_arg *args, size_t nargs, uint64_t ts) {
     if (c->dead) {
         return -1;
     }
@@ -81,8 +89,11 @@ int x12_conn_event(struct x12_conn *c, const x12_iface_desc *iface,
         x12_conn_kill(c, "unknown event in server code");
         return -1;
     }
+    if (ts == 0) {
+        ts = x12_now_ns();
+    }
     size_t written = 0;
-    int rc = x12_encode(iface, msg, object, x12_now_ns(),
+    int rc = x12_encode(iface, msg, object, ts,
                         args, nargs, c->out + c->out_len,
                         X12_IO_BUF - c->out_len, &written);
     if (rc == X12_ERR_CAP) {

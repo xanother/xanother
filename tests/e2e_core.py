@@ -27,7 +27,7 @@ def handshake(s):
     assert set(welcome["args"]["caps"]) == {CAP_SEAT, CAP_OUTPUT_INFO}, welcome
     assert welcome["args"]["server_version"] == 1, welcome
     globals_seen = {}
-    for _ in range(4):
+    for _ in range(5):
         g = s.wait_for("global")
         globals_seen[g["args"]["name"]] = (g["args"]["version"], g["args"]["required_cap"])
     assert globals_seen == {
@@ -35,6 +35,7 @@ def handshake(s):
         "x12_buffer_manager": (1, "none"),
         "x12_seat": (2, "seat"),
         "x12_screencopy": (1, "screencopy"),
+        "x12_output": (2, "output-info"),
     }, globals_seen
     return welcome
 

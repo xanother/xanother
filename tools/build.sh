@@ -16,6 +16,7 @@ gcc $CFLAGS -o build/x12-server \
     src/server/main.c \
     src/core/conn.c \
     src/core/objects.c \
+    src/core/output.c \
     src/core/dispatch.c \
     src/core/handlers.c \
     src/core/buffer.c \

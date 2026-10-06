@@ -64,6 +64,13 @@ int x12_conn_event(struct x12_conn *c, const x12_iface_desc *iface,
                    const char *evt, uint32_t object,
                    const x12_arg *args, size_t nargs);
 
+// like x12_conn_event but stamps the event with the given nanosecond
+// time instead of now, presentation feedback carries the real scanout
+// moment this way. ts zero falls back to now
+int x12_conn_event_ts(struct x12_conn *c, const x12_iface_desc *iface,
+                      const char *evt, uint32_t object,
+                      const x12_arg *args, size_t nargs, uint64_t ts);
+
 // like x12_conn_event but queues a real fd for scm rights delivery, the
 // arg at fd_arg_index receives the wire slot of the descriptor and the
 // flush is immediate so the fd travels with its event

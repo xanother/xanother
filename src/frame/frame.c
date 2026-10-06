@@ -6,6 +6,7 @@
 #include <poll.h>
 #include <unistd.h>
 
+#include "output.h"
 #include "x12_protocol.h"
 
 // a sync_file fd signals readiness through POLLIN, a missing fence is
@@ -102,6 +103,12 @@ static int retire_current(struct x12_conn *c, struct x12_surface_state *s) {
         e->cbs[i] = s->current_cbs[i];
     }
     s->n_current_cbs = 0;
+    // presentation feedback rides the retire: the entry remembers the
+    // commit token and the moment its frame reached the screen
+    e->token = s->token;
+    e->shown_ns = s->shown_ns;
+    e->shown = s->shown;
+    s->shown = 0;
     return 0;
 }
 
@@ -154,6 +161,7 @@ int x12_frame_commit(struct x12_conn *c, uint32_t surface_id,
     // the token comes back as committed so present can name this exact
     // commit instead of a fresh serial
     uint64_t token = x12_conn_next_token(c);
+    s->token = token;
     x12_arg t[1] = { { .u64 = token } };
     return x12_conn_event(c, x12_iface_find("x12_surface"), "committed",
                           surface_id, t, 1);
@@ -194,6 +202,12 @@ void x12_frame_drain(struct x12_conn *c, struct x12_surface_state *s) {
             emit_release(c, e->buffer_id);
         }
         retire_free_cbs(c, e, 0);
+        // the output hears about every frame that reached the screen,
+        // the token names its commit and the time is the scanout moment
+        if (e->shown) {
+            x12_output_present(e->token, X12_OUTPUT_PRESENT_KIND_COPY,
+                               e->shown_ns);
+        }
         if (e->fence >= 0) {
             close(e->fence);
         }
@@ -227,6 +241,18 @@ static void drain_force(struct x12_conn *c, struct x12_surface_state *s,
         }
     }
     s->n_retire = 0;
+}
+
+void x12_frame_presented(struct x12_conn *c, uint32_t surface_id,
+                         uint64_t ns) {
+    struct x12_object *o = x12_objects_get(&c->objects, surface_id);
+    if (!o || o->kind != OBJ_SURFACE) {
+        return;
+    }
+    // the compositor paints and pushes this frame to the host right
+    // now, the retire later reports the moment as the scanout time
+    o->as.surface.shown = 1;
+    o->as.surface.shown_ns = ns;
 }
 
 void x12_frame_destroy(struct x12_conn *c, struct x12_surface_state *s) {

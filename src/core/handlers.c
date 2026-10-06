@@ -3,6 +3,8 @@
 
 #include "handlers.h"
 
+#include "output.h"
+
 #include <string.h>
 #include <unistd.h>
 
@@ -40,6 +42,7 @@ static const struct bind_rule bind_rules[] = {
     { "x12_buffer_manager", OBJ_BUFFER_MANAGER, X12_CAPABILITY_NONE },
     { "x12_seat", OBJ_SEAT, X12_CAPABILITY_SEAT },
     { "x12_screencopy", OBJ_SCREENCOPY, X12_CAPABILITY_SCREENCOPY },
+    { "x12_output", OBJ_OUTPUT, X12_CAPABILITY_OUTPUT_INFO },
 };
 
 static const struct bind_rule *rule_by_name(const char *name) {
@@ -146,6 +149,41 @@ static int handle_bind(struct x12_conn *c, uint32_t object, const x12_arg *args)
         x12_conn_error(c, X12_ERROR_CODE_INVALID_ID, object);
         return 0;
     }
+    // a fresh output announces its screen description and joins the
+    // presentation feedback fan out
+    if (rule->kind == OBJ_OUTPUT) {
+        x12_output_bind(c, id);
+        const x12_iface_desc *oi = x12_iface_find("x12_output");
+        uint32_t w, hgt, refresh;
+        const char *oname;
+        x12_output_describe(&w, &hgt, &refresh, &oname);
+        // the one mode the screen runs is both current and preferred,
+        // the enum can only say one thing so it names the truth a user
+        // picking a mode cares about
+        x12_arg m[4] = {
+            { .u64 = w },
+            { .u64 = hgt },
+            { .u64 = refresh },
+            { .u64 = X12_OUTPUT_MODE_FLAG_PREFERRED },
+        };
+        if (x12_conn_event(c, oi, "mode", id, m, 4) != 0) {
+            return -1;
+        }
+        x12_arg g[4] = { { .i64 = 0 }, { .i64 = 0 }, { .u64 = 0 }, { .u64 = 0 } };
+        if (x12_conn_event(c, oi, "geometry", id, g, 4) != 0) {
+            return -1;
+        }
+        x12_arg sc[1] = { { .i64 = 256 } };
+        if (x12_conn_event(c, oi, "scale", id, sc, 1) != 0) {
+            return -1;
+        }
+        x12_arg nm[1] = {
+            { .str = oname, .str_len = (uint32_t)strlen(oname) },
+        };
+        if (x12_conn_event(c, oi, "name", id, nm, 1) != 0) {
+            return -1;
+        }
+    }
     // a fresh buffer manager announces the formats it composites on
     if (rule->kind == OBJ_BUFFER_MANAGER) {
         const x12_iface_desc *bm = x12_iface_find("x12_buffer_manager");
@@ -174,6 +212,23 @@ static int handle_bind(struct x12_conn *c, uint32_t object, const x12_arg *args)
             return -1;
         }
     }
+    return 0;
+}
+
+int x12_handle_output(struct x12_conn *c, uint32_t object,
+                      const x12_msg_desc *msg, const x12_arg *args) {
+    (void)args;
+    if (strcmp(msg->name, "release") == 0) {
+        x12_output_unbind(c);
+        x12_objects_free(&c->objects, object);
+        return 0;
+    }
+    if (strcmp(msg->name, "set_vrr") == 0) {
+        // vrr rides with the hardware parties, anything else is a lie
+        x12_conn_error(c, X12_ERROR_CODE_IMPLEMENTATION, object);
+        return 0;
+    }
+    x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
     return 0;
 }
 

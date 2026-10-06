@@ -30,6 +30,7 @@ enum x12_obj_kind {
     OBJ_TOUCH,
     OBJ_SEAT,
     OBJ_SCREENCOPY,
+    OBJ_OUTPUT,
     OBJ_DATA_DEVICE,
     OBJ_DATA_SOURCE,
     OBJ_DATA_OFFER,

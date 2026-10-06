@@ -17,6 +17,7 @@
 #include "conn.h"
 #include "dispatch.h"
 #include "limits.h"
+#include "output.h"
 #include "buffer.h"
 #include "frame.h"
 #include "windows.h"
@@ -33,6 +34,9 @@ static void client_teardown(struct x12_conn *c) {
     // a dying selection owner drops both slots, the readers learn the
     // generation moved and their offers are finished
     x12_selection_release_owner(c);
+    // output bindings go with the connection, the fan out skips dead
+    // pointers but the slot goes back now
+    x12_output_unbind(c);
     x12_windows_remove_client(c);
     for (uint32_t id = 1; id < X12_MAX_OBJECTS; id++) {
         struct x12_object *o = x12_objects_get(&c->objects, id);
@@ -90,6 +94,9 @@ int main(int argc, char **argv) {
     }
     uint32_t canvas_w = 0, canvas_h = 0;
     x12_backend.get_size(&canvas_w, &canvas_h);
+    // the output global reports the real canvas, a hardware backend may
+    // have set its own name and refresh during init already
+    x12_output_info(canvas_w, canvas_h, 0, NULL);
     x12_comp_set_size(canvas_w, canvas_h);
     x12_windows_init();
     x12_windows_set_output(canvas_w, canvas_h);

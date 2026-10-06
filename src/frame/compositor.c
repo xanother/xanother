@@ -8,6 +8,7 @@
 
 #include "backend.h"
 #include "cpu.h"
+#include "frame.h"
 #include "gpu.h"
 #include "windows.h"
 #include "input.h"
@@ -255,5 +256,13 @@ int x12_comp_pass(struct x12_conn *conns, size_t n) {
     sprite_drawn = have_sprite;
 
     x12_backend.present(fb, rects, n_rects);
+    // every surface the stack showed takes the moment the display picks
+    // the frame up, the retire later reports it as the scanout time. a
+    // surface that never reached the pass never gets a present at all
+    uint64_t shown = x12_now_ns();
+    for (int i = 0; i < nw; i++) {
+        const struct x12_winview *v = x12_windows_at(i);
+        x12_frame_presented(v->client, v->surface_id, shown);
+    }
     return 1;
 }
