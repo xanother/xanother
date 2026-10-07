@@ -82,7 +82,7 @@ static int halt_requested(void) {
 static void shutdown(void) {
 }
 
-const struct x12_backend_ops x12_backend = {
+const struct x12_backend_ops x12_backend_headless = {
     .init = init,
     .get_size = get_size,
     .present = present,

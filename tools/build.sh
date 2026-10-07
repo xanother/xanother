@@ -11,8 +11,9 @@ cd "$(dirname "$0")/.."
 python3 tools/x12gen.py --lang c --out-dir build/gen
 
 CFLAGS="-std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -I src/wire -I src/core -I src/frame -I src/render -I src/backend -I src/input -I src/data -I build/gen"
+DRM_CFLAGS=$(pkg-config --cflags libdrm 2>/dev/null)
 
-gcc $CFLAGS -o build/x12-server \
+gcc $CFLAGS $DRM_CFLAGS -o build/x12-server \
     src/server/main.c \
     src/core/conn.c \
     src/core/objects.c \
@@ -29,10 +30,10 @@ gcc $CFLAGS -o build/x12-server \
     src/data/selection.c \
     src/render/cpu.c \
     src/render/gpu.c \
-    src/backend/backend_headless.c \
+    src/backend/backend_headless.c src/backend/backend_kms.c \
     src/wire/x12_wire.c \
     build/gen/x12_tables.c \
-    -lxkbcommon -ldl
+    -lxkbcommon -ldl -ldrm
 
 gcc $CFLAGS -o build/c_roundtrip \
     tests/c_roundtrip.c \

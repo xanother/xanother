@@ -31,6 +31,11 @@ struct x12_backend_ops {
     int host_cursor;
 };
 
-extern const struct x12_backend_ops x12_backend;
+// the host the server runs on, picked once at startup from the command
+// line before any client connects
+extern const struct x12_backend_ops *x12_backend;
+
+extern const struct x12_backend_ops x12_backend_headless;
+extern const struct x12_backend_ops x12_backend_kms;
 
 #endif

@@ -28,6 +28,8 @@
 #include "source.h"
 #include "selection.h"
 
+const struct x12_backend_ops *x12_backend;
+
 // the reap path gives everything back: surfaces retire their buffers,
 // pools unmap and parked fds close before the socket goes away
 static void client_teardown(struct x12_conn *c) {
@@ -76,6 +78,15 @@ static int make_socket(const char *path) {
 int main(int argc, char **argv) {
     const char *sock_path = argc > 1 ? argv[1] : "/tmp/x12.sock";
     struct sigaction sa;
+
+    // the host is a startup decision: --kms rides the drm card the flag
+    // names, everything else runs headless
+    x12_backend = &x12_backend_headless;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--kms") == 0) {
+            x12_backend = &x12_backend_kms;
+        }
+    }
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = on_term;
     sigaction(SIGINT, &sa, 0);
@@ -87,13 +98,16 @@ int main(int argc, char **argv) {
         perror("socket");
         return 1;
     }
-    if (x12_backend.init(argc, argv) != 0) {
+    if (x12_backend->init(argc, argv) != 0) {
         fprintf(stderr, "x12-server: bad backend arguments\n");
         close(srv);
+        // the socket file stays behind otherwise and the next spawn
+        // connects into the void instead of a fresh server
+        unlink(sock_path);
         return 1;
     }
     uint32_t canvas_w = 0, canvas_h = 0;
-    x12_backend.get_size(&canvas_w, &canvas_h);
+    x12_backend->get_size(&canvas_w, &canvas_h);
     // the output global reports the real canvas, a hardware backend may
     // have set its own name and refresh during init already
     x12_output_info(canvas_w, canvas_h, 0, NULL);
@@ -184,7 +198,7 @@ int main(int argc, char **argv) {
             perror("poll");
             break;
         }
-        if (x12_backend.halt_requested()) {
+        if (x12_backend->halt_requested()) {
             break;
         }
 
@@ -252,7 +266,7 @@ int main(int argc, char **argv) {
         // the composite pass repaints whatever the commits damaged, one
         // pass per loop round keeps the damage accounting single writer
         x12_comp_pass(conns, X12_MAX_CLIENTS);
-        x12_backend.pump();
+        x12_backend->pump();
     }
 
     for (size_t i = 0; i < X12_MAX_CLIENTS; i++) {
@@ -261,7 +275,7 @@ int main(int argc, char **argv) {
         }
     }
     x12_gpu_shutdown();
-    x12_backend.shutdown();
+    x12_backend->shutdown();
     close(srv);
     unlink(sock_path);
     fprintf(stderr, "x12-server: bye\n");

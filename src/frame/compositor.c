@@ -72,7 +72,7 @@ static int sprite_drawn;
 
 static int sprite_view(struct x12_view *view, struct x12_conn **owner,
                        uint32_t *sid) {
-    if (x12_backend.host_cursor) {
+    if (x12_backend->host_cursor) {
         return 0;
     }
     int32_t px, py;
@@ -255,7 +255,7 @@ int x12_comp_pass(struct x12_conn *conns, size_t n) {
     sprite_last_sid = ssid;
     sprite_drawn = have_sprite;
 
-    x12_backend.present(fb, rects, n_rects);
+    x12_backend->present(fb, rects, n_rects);
     // every surface the stack showed takes the moment the display picks
     // the frame up, the retire later reports it as the scanout time. a
     // surface that never reached the pass never gets a present at all
