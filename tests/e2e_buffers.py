@@ -99,11 +99,12 @@ def main():
         make_pool(s, 4096, 23)
         no_errors(s)
 
-        # dmabuf rides with the gpu backend, the refusal stays honest
+        # dmabuf import needs a real dma buffer, anything else is turned
+        # away loudly instead of becoming a buffer behind the scenes
         s.request("x12_buffer_manager", "import_dmabuf", 11, fd=0, width=4,
                   height=4, format=XR24, modifier=0, stride=16, id=26)
         err = s.wait_for("error")
-        assert err["args"]["code"] == "implementation", err
+        assert err["args"]["code"] == "bad-value", err
 
         # commit machine and the release credit model: the credit names
         # the buffer that earned it

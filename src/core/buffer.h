@@ -25,6 +25,13 @@ int x12_buffer_create(struct x12_conn *c, uint32_t pool_id, uint32_t id,
                       uint32_t stride, uint32_t format);
 
 // frees the slot, surface references to it are dropped by the caller
+// imports a client dma buffer: the fd must be a real dmabuf, the
+// mapping is attempted for the composite fallback and stays absent for
+// gpu only buffers that reach the screen through direct scanout
+int x12_buffer_import(struct x12_conn *c, uint32_t id, int fd, uint32_t width,
+                      uint32_t height, uint32_t format, uint64_t modifier,
+                      uint32_t stride);
+
 void x12_buffer_destroy(struct x12_conn *c, uint32_t id);
 
 // bytes per pixel for the formats the buffer path understands, 0 when the

@@ -351,8 +351,19 @@ int x12_handle_buffer_manager(struct x12_conn *c, uint32_t object,
         return 0;
     }
     if (strcmp(msg->name, "import_dmabuf") == 0) {
-        // the dmabuf path rides with the gpu backend, not here
-        x12_conn_error(c, X12_ERROR_CODE_IMPLEMENTATION, object);
+        int fd = -1;
+        if (x12_conn_take_fd(c, (uint32_t)args[0].u64, &fd) != 0) {
+            x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
+            return 0;
+        }
+        int rc = x12_buffer_import(c, (uint32_t)args[6].u64, fd,
+                                   (uint32_t)args[1].u64,
+                                   (uint32_t)args[2].u64,
+                                   (uint32_t)args[3].u64, args[4].u64,
+                                   (uint32_t)args[5].u64);
+        if (rc != 0) {
+            x12_conn_error(c, (uint32_t)rc, object);
+        }
         return 0;
     }
     x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);

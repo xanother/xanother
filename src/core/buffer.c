@@ -3,6 +3,9 @@
 
 #include "buffer.h"
 
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -94,6 +97,7 @@ int x12_buffer_create(struct x12_conn *c, uint32_t pool_id, uint32_t id,
     o->as.buffer.stride = stride;
     o->as.buffer.format = format;
     o->as.buffer.pool_id = pool_id;
+    o->as.buffer.dmabuf_fd = -1;
     return 0;
 }
 
@@ -110,7 +114,73 @@ void x12_buffer_destroy(struct x12_conn *c, uint32_t id) {
             x12_frame_drop_buffer(c, &s->as.surface, id);
         }
     }
+    if (o->as.buffer.pixels && o->as.buffer.map_size) {
+        munmap((void *)(uintptr_t)o->as.buffer.pixels, o->as.buffer.map_size);
+    }
+    if (o->as.buffer.dmabuf_fd >= 0) {
+        close(o->as.buffer.dmabuf_fd);
+    }
     x12_objects_free(&c->objects, id);
+}
+
+// a real dma-buf exposes an exporter name in its fdinfo, anything else
+// on the wire claiming to be one gets turned away before it becomes a
+// buffer the compositor would happily scan out blind
+static int is_dmabuf_fd(int fd) {
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/fdinfo/%d", fd);
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        return 0;
+    }
+    char line[256];
+    int found = 0;
+    while (fgets(line, sizeof line, f)) {
+        if (strncmp(line, "exp_name:", 9) == 0) {
+            found = 1;
+            break;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+int x12_buffer_import(struct x12_conn *c, uint32_t id, int fd, uint32_t width,
+                      uint32_t height, uint32_t format, uint64_t modifier,
+                      uint32_t stride) {
+    uint32_t bpp = x12_format_bpp(format);
+    if (fd < 0 || bpp == 0 || width == 0 || height == 0 ||
+        stride < (uint64_t)width * bpp) {
+        close(fd);
+        return X12_ERROR_CODE_BAD_VALUE;
+    }
+    if (!is_dmabuf_fd(fd)) {
+        close(fd);
+        return X12_ERROR_CODE_BAD_VALUE;
+    }
+    // the mapping is a convenience for the composite fallback, a gpu
+    // only buffer stays unmapped and reaches the screen through scanout
+    size_t size = (size_t)stride * height;
+    uint8_t *map = mmap(0, size, PROT_READ, MAP_SHARED, fd, 0);
+    if (x12_objects_alloc(&c->objects, id, OBJ_BUFFER,
+                          x12_iface_find("x12_buffer")) != 0) {
+        if (map != MAP_FAILED) {
+            munmap(map, size);
+        }
+        close(fd);
+        return X12_ERROR_CODE_INVALID_ID;
+    }
+    struct x12_object *o = x12_objects_get(&c->objects, id);
+    o->as.buffer.pixels = map == MAP_FAILED ? NULL : map;
+    o->as.buffer.map_size = map == MAP_FAILED ? 0 : size;
+    o->as.buffer.width = width;
+    o->as.buffer.height = height;
+    o->as.buffer.stride = stride;
+    o->as.buffer.format = format;
+    o->as.buffer.pool_id = 0;
+    o->as.buffer.dmabuf_fd = fd;
+    o->as.buffer.modifier = modifier;
+    return 0;
 }
 
 // teardown hook for the reap path, the mapping goes away with the client

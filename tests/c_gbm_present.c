@@ -65,9 +65,10 @@ int main(int argc, char **argv) {
     struct x12_rect full = { 0, 0, W, H };
     struct x12_view v1 = { 8, 4, W / 2, 16 };
     struct x12_bufref r1 = { 0, W / 2, 16, W / 2 * 4, X12_FORMAT_XRGB8888,
-                             xr };
+                             xr, -1, 0 };
     struct x12_view v2 = { 20, 16, 32, 32 };
-    struct x12_bufref r2 = { 0, 24, 24, 24 * 4, X12_FORMAT_ARGB8888, ar };
+    struct x12_bufref r2 = { 0, 24, 24, 24 * 4, X12_FORMAT_ARGB8888, ar,
+                             -1, 0 };
 
     x12_cpu_fill(cpu_fb, W, H, &full, 0xFF000000u);
     x12_cpu_blend_view(cpu_fb, W, H, &v1, &r1, 256, &full);

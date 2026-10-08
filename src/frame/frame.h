@@ -44,6 +44,10 @@ void x12_frame_drain(struct x12_conn *c, struct x12_surface_state *s);
 // drain hook for the main loop, walks every surface of the client
 void x12_frame_drain_client(struct x12_conn *c);
 
+// the scanout session hands the release credit back when the buffer
+// leaves the screen, a stolen frame waits for exactly this
+void x12_frame_credit(struct x12_conn *c, uint32_t buffer_id);
+
 // the compositor stamps the frame it just pushed to the host with the
 // moment the display took it, the retire later reports it as the
 // scanout time in the output present feedback

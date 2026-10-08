@@ -43,11 +43,15 @@ enum x12_role {
 #define X12_FORMAT_XRGB8888 0x34325258u
 #define X12_FORMAT_ARGB8888 0x34325241u
 
-// pixels a buffer reference points at, the snapshot a commit carries
+// pixels a buffer reference points at, the snapshot a commit carries.
+// a dmabuf reference carries its descriptor instead, pixels stay NULL
+// unless the buffer happens to map for the composite fallback
 struct x12_bufref {
     uint32_t object;
     uint32_t width, height, stride, format;
     const uint8_t *pixels;
+    int dmabuf_fd;  // -1 = plain shm pixels
+    uint64_t modifier;
 };
 
 struct x12_pool_state {
@@ -59,7 +63,10 @@ struct x12_pool_state {
 struct x12_buffer_state {
     const uint8_t *pixels;
     uint32_t width, height, stride, format;
-    uint32_t pool_id;
+    uint32_t pool_id;      // 0 = not carved from a shm pool
+    int dmabuf_fd;         // -1 = shm pixels, else the imported dma fd
+    uint64_t modifier;
+    size_t map_size;       // dmabuf mapping size, 0 = no mapping
 };
 
 // one committed frame that left the current slot and waits for its fence
@@ -76,6 +83,10 @@ struct x12_retire {
     uint64_t token;
     uint64_t shown_ns;
     int shown;
+    // a stolen frame went to the screen through direct scanout: its
+    // release credit waits with the scanout session for the replacing
+    // flip, the retire itself only carries the frame callbacks
+    int stolen;
 };
 
 struct x12_surface_state {
@@ -106,6 +117,9 @@ struct x12_surface_state {
     uint64_t token;
     uint64_t shown_ns;
     int shown;
+    // the current frame went to the screen through direct scanout and
+    // its release credit belongs to the scanout session
+    int scanned_out;
 
     // retired frames in commit order, the front one leaves first
     struct x12_retire retire[X12_MAX_RETIRE];

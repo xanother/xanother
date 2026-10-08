@@ -24,6 +24,9 @@ void x12_frame_init(struct x12_surface_state *s) {
     s->current_scale = X12_FIXED24P8_ONE;
     s->pending_fence = -1;
     s->fence = -1;
+    // zero memory reads as fd zero, the empty slot must read as none
+    s->pending.dmabuf_fd = -1;
+    s->current.dmabuf_fd = -1;
 }
 
 int x12_frame_set_buffer(struct x12_conn *c, struct x12_surface_state *s,
@@ -31,6 +34,7 @@ int x12_frame_set_buffer(struct x12_conn *c, struct x12_surface_state *s,
     if (buffer_id == 0) {
         s->pending.object = 0;
         s->pending.pixels = 0;
+        s->pending.dmabuf_fd = -1;
         s->has_pending = 1;
         return 0;
     }
@@ -44,6 +48,8 @@ int x12_frame_set_buffer(struct x12_conn *c, struct x12_surface_state *s,
     s->pending.stride = b->as.buffer.stride;
     s->pending.format = b->as.buffer.format;
     s->pending.pixels = b->as.buffer.pixels;
+    s->pending.dmabuf_fd = b->as.buffer.dmabuf_fd;
+    s->pending.modifier = b->as.buffer.modifier;
     s->has_pending = 1;
     return 0;
 }
@@ -104,11 +110,14 @@ static int retire_current(struct x12_conn *c, struct x12_surface_state *s) {
     }
     s->n_current_cbs = 0;
     // presentation feedback rides the retire: the entry remembers the
-    // commit token and the moment its frame reached the screen
+    // commit token and the moment its frame reached the screen. a
+    // stolen frame hands its release credit to the scanout session
     e->token = s->token;
     e->shown_ns = s->shown_ns;
     e->shown = s->shown;
+    e->stolen = s->scanned_out;
     s->shown = 0;
+    s->scanned_out = 0;
     return 0;
 }
 
@@ -177,6 +186,10 @@ static void emit_release(struct x12_conn *c, uint32_t buffer_id) {
     x12_conn_event(c, x12_iface_find("x12_buffer"), "release", buffer_id, 0, 0);
 }
 
+void x12_frame_credit(struct x12_conn *c, uint32_t buffer_id) {
+    emit_release(c, buffer_id);
+}
+
 static void retire_free_cbs(struct x12_conn *c, struct x12_retire *e,
                             int silent) {
     for (uint8_t i = 0; i < e->n_cbs; i++) {
@@ -198,7 +211,9 @@ void x12_frame_drain(struct x12_conn *c, struct x12_surface_state *s) {
             // the front frame owns the order, later credits wait behind it
             return;
         }
-        if (e->buffer_id) {
+        // a stolen frame keeps its buffer hostage until the scanout
+        // session sees the replacing flip, everything else credits now
+        if (e->buffer_id && !e->stolen) {
             emit_release(c, e->buffer_id);
         }
         retire_free_cbs(c, e, 0);
