@@ -13,6 +13,28 @@
 
 struct x12_rect;
 
+// direct scanout of a client dma buffer: the backend flips the buffer
+// straight to the screen when the hardware takes it, the composite pass
+// stays the fallback for everything the screen cannot show directly
+struct x12_scanout_req {
+    int dmabuf_fd;
+    uint32_t width, height, format, stride;
+    uint64_t modifier;
+    uint32_t cookie;  // comes back with the events, names the request
+};
+
+// scanout progress: landed = the buffer hit the screen at the reported
+// moment, replaced = another frame took the screen and the buffer is
+// free to reuse again
+#define X12_SCANOUT_LANDED 1
+#define X12_SCANOUT_REPLACED 2
+
+struct x12_scanout_event {
+    int kind;
+    uint32_t cookie;
+    uint64_t ts;
+};
+
 struct x12_backend_ops {
     // reads its own flags from argv, returns 0 on success
     int (*init)(int argc, char **argv);
@@ -21,6 +43,12 @@ struct x12_backend_ops {
     // pushes the presented frame to the host
     void (*present)(const uint32_t *fb, const struct x12_rect *rects,
                     int n_rects);
+    // direct scanout: 1 when the buffer went to the screen through a
+    // flip, 0 when the caller must composite instead. both may be NULL
+    // on backends that never scan out directly
+    int (*scanout)(const struct x12_scanout_req *req);
+    // pops one scanout progress event, 1 = filled, 0 = nothing new
+    int (*scanout_poll)(struct x12_scanout_event *ev);
     // pumps host events, may present again on expose
     void (*pump)(void);
     // nonzero when the host asks the server to quit

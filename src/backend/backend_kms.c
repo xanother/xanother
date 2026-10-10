@@ -16,6 +16,7 @@
 
 #include <poll.h>
 
+#include <drm_fourcc.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <xf86drm.h>
@@ -34,6 +35,18 @@ struct dumb_bo {
     void *map;
 };
 
+// a client buffer imported for direct scanout: the gem handle lives on
+// this device, the fb wraps it and the flip takes it straight to the
+// screen. the flip event names the slot so the progress reporting can
+// tell landed and replaced apart
+struct so_fb {
+    int in_use;
+    int queued;
+    uint32_t fb_id;
+    uint32_t handle;
+    uint32_t cookie;
+};
+
 struct scanout {
     int fd;
     uint32_t conn_id, crtc_id;
@@ -44,6 +57,7 @@ struct scanout {
     int pending;  // slot queued for the next flip, -1 = none
     int active;
 };
+
 
 // dumb buffer lifecycle through the raw drm ioctls
 static int dumb_alloc(int fd, struct dumb_bo *b, uint32_t w, uint32_t h) {
@@ -91,14 +105,57 @@ static struct scanout sc;
 static const char *ppm_path = "screen.ppm";
 static drmEventContext evctx;
 
+static struct so_fb so[2];
+static struct so_fb *so_front;  // the scanout fb on screen, NULL = dumb
+static struct x12_scanout_event so_evq[8];
+static int so_evq_n;
+
+static void push_event(int kind, uint32_t cookie, uint64_t ts) {
+    if (so_evq_n < (int)(sizeof so_evq / sizeof so_evq[0])) {
+        so_evq[so_evq_n].kind = kind;
+        so_evq[so_evq_n].cookie = cookie;
+        so_evq[so_evq_n].ts = ts;
+        so_evq_n++;
+    }
+}
+
+static void so_free(struct so_fb *b) {
+    if (b->fb_id) {
+        drmModeRmFB(sc.fd, b->fb_id);
+    }
+    if (b->handle) {
+        struct drm_gem_close gc = { .handle = b->handle };
+        drmIoctl(sc.fd, DRM_IOCTL_GEM_CLOSE, &gc);
+    }
+    b->fb_id = 0;
+    b->handle = 0;
+    b->in_use = 0;
+    b->queued = 0;
+}
+
 static void flip_handler(int fd, unsigned int seq, unsigned int tv_sec,
                          unsigned int tv_usec, void *user) {
     (void)fd;
     (void)seq;
-    (void)tv_sec;
-    (void)tv_usec;
-    (void)user;
-    // the queued slot just landed on screen, the chain is free again
+    uint64_t ts = (uint64_t)tv_sec * 1000000000ull + (uint64_t)tv_usec * 1000ull;
+    struct so_fb *landed = user;
+    // whatever the screen showed before this landing is gone now, a
+    // scanout buffer that leaves gets its replacement reported so the
+    // release credit can go home
+    if (so_front && so_front != landed) {
+        push_event(X12_SCANOUT_REPLACED, so_front->cookie, ts);
+        so_free(so_front);
+        so_front = 0;
+    }
+    if (landed) {
+        // the client buffer hit the screen, the flip moment is the
+        // scanout time the present feedback reports
+        landed->queued = 0;
+        push_event(X12_SCANOUT_LANDED, landed->cookie, ts);
+        so_front = landed;
+        return;
+    }
+    // a dumb chain slot just landed on screen, the chain is free again
     if (sc.pending >= 0) {
         sc.front = sc.pending;
         sc.pending = -1;
@@ -114,10 +171,22 @@ static void drain_flip_events(void) {
     }
 }
 
+static int flip_busy(void) {
+    if (sc.pending >= 0) {
+        return 1;
+    }
+    for (int i = 0; i < 2; i++) {
+        if (so[i].queued) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 // waits until the queued flip lands or the screen proves dead. the
 // chain only holds two slots, a third frame must not race the flip
 static void wait_pending(void) {
-    for (int spin = 0; sc.pending >= 0 && spin < 64; spin++) {
+    for (int spin = 0; flip_busy() && spin < 64; spin++) {
         struct pollfd p = { .fd = sc.fd, .events = POLLIN };
         if (poll(&p, 1, 100) <= 0) {
             break;
@@ -261,7 +330,9 @@ static void kms_destroy(void) {
     wait_pending();
     for (int i = 0; i < 2; i++) {
         dumb_free(sc.fd, &sc.slot[i]);
+        so_free(&so[i]);
     }
+    so_front = 0;
     drmDropMaster(sc.fd);
     close(sc.fd);
     sc.fd = -1;
@@ -335,6 +406,82 @@ static int kms_halt_requested(void) {
     return 0;
 }
 
+static int kms_scanout(const struct x12_scanout_req *req) {
+    if (!sc.active || !req || req->dmabuf_fd < 0) {
+        return 0;
+    }
+    if (flip_busy()) {
+        wait_pending();
+    }
+    if (flip_busy()) {
+        // a flip never reported, the caller composites this round
+        return 0;
+    }
+    struct so_fb *b = 0;
+    for (int i = 0; i < 2; i++) {
+        if (!so[i].in_use) {
+            b = &so[i];
+            break;
+        }
+    }
+    if (!b) {
+        return 0;
+    }
+    // the client buffer becomes a gem handle on this device and an fb
+    // the crtc can flip to directly, no copy anywhere
+    uint32_t handle = 0;
+    if (drmPrimeFDToHandle(sc.fd, req->dmabuf_fd, &handle) != 0) {
+        return 0;
+    }
+    uint32_t handles[4] = { handle, 0, 0, 0 };
+    uint32_t pitches[4] = { req->stride, 0, 0, 0 };
+    uint32_t offsets[4] = { 0, 0, 0, 0 };
+    uint32_t fb_id = 0;
+    int rc;
+    if (req->modifier && req->modifier != DRM_FORMAT_MOD_INVALID) {
+        uint64_t mods[4] = { req->modifier, 0, 0, 0 };
+        rc = drmModeAddFB2WithModifiers(sc.fd, req->width, req->height,
+                                        req->format, handles, pitches,
+                                        offsets, mods, &fb_id,
+                                        DRM_MODE_FB_MODIFIERS);
+    } else {
+        rc = drmModeAddFB2(sc.fd, req->width, req->height, req->format,
+                           handles, pitches, offsets, &fb_id, 0);
+    }
+    if (rc != 0) {
+        struct drm_gem_close gc = { .handle = handle };
+        drmIoctl(sc.fd, DRM_IOCTL_GEM_CLOSE, &gc);
+        return 0;
+    }
+    if (drmModePageFlip(sc.fd, sc.crtc_id, fb_id, DRM_MODE_PAGE_FLIP_EVENT,
+                        b) != 0) {
+        fprintf(stderr, "x12-server: scanout flip failed: %s\n",
+                strerror(errno));
+        drmModeRmFB(sc.fd, fb_id);
+        struct drm_gem_close gc = { .handle = handle };
+        drmIoctl(sc.fd, DRM_IOCTL_GEM_CLOSE, &gc);
+        return 0;
+    }
+    b->in_use = 1;
+    b->queued = 1;
+    b->fb_id = fb_id;
+    b->handle = handle;
+    b->cookie = req->cookie;
+    return 1;
+}
+
+static int kms_scanout_poll(struct x12_scanout_event *ev) {
+    if (so_evq_n == 0) {
+        return 0;
+    }
+    *ev = so_evq[0];
+    for (int i = 1; i < so_evq_n; i++) {
+        so_evq[i - 1] = so_evq[i];
+    }
+    so_evq_n--;
+    return 1;
+}
+
 const struct x12_backend_ops x12_backend_kms = {
     .init = kms_init,
     .get_size = kms_get_size,
@@ -343,4 +490,6 @@ const struct x12_backend_ops x12_backend_kms = {
     .halt_requested = kms_halt_requested,
     .shutdown = kms_destroy,
     .host_cursor = 0,
+    .scanout = kms_scanout,
+    .scanout_poll = kms_scanout_poll,
 };

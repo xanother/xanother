@@ -25,4 +25,10 @@ void x12_comp_full_damage(void);
 // nonzero when a frame was presented
 int x12_comp_pass(struct x12_conn *conns, size_t n);
 
+// scanout progress: turns flip landings into present feedback and
+// replaces into release credits, called once per loop round. drop
+// forgets the sessions of a dying connection
+void x12_comp_scanout_pump(void);
+void x12_comp_scanout_drop(struct x12_conn *c);
+
 #endif

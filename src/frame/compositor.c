@@ -3,6 +3,8 @@
 
 #include "compositor.h"
 
+#include <poll.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -12,6 +14,8 @@
 #include "gpu.h"
 #include "windows.h"
 #include "input.h"
+#include "output.h"
+#include "x12_protocol.h"
 
 // damage rect capacity of one pass, overflow means full repaint so a
 // burst of small updates cannot drown the list
@@ -22,6 +26,9 @@ static uint32_t fb_w, fb_h;
 static struct x12_rect frame_damage[X12_FRAME_DAMAGE];
 static int n_frame_damage;
 static int full_damage;
+// the screen shows a scanned out frame the cpu fb never mirrored, the
+// next composite repaints everything to get the mirror honest again
+static int fb_stale;
 
 void x12_comp_set_size(uint32_t w, uint32_t h) {
     free(fb);
@@ -63,6 +70,21 @@ static void surface_view(const struct x12_bufref *ref, uint32_t scale,
     view->h = ref->height * 256 / scale;
 }
 
+// direct scanout sessions waiting for their feedback: the frame went
+// to the screen through a flip, its present comes with the landing and
+// its release credit waits for the replacing flip
+#define X12_SCANOUT_SLOTS 4
+
+struct scanout_wait {
+    int used;
+    struct x12_conn *c;
+    uint32_t buffer_id;
+    uint64_t token;
+    int landed;
+};
+
+static struct scanout_wait so_wait[X12_SCANOUT_SLOTS];
+
 // the pointer sprite: the hovered client's cursor surface drawn at the
 // pointer minus the hotspot. backends that draw a host cursor get no
 // sprite at all
@@ -91,6 +113,108 @@ static int sprite_view(struct x12_view *view, struct x12_conn **owner,
     *owner = cc;
     *sid = cc->cursor_surface_id;
     return 1;
+}
+
+// one fullscreen opaque window 1:1 on the canvas, carrying a dma
+// buffer whose fence has signaled: the frame goes to the screen without
+// the composite pass. anything else falls through to compositing
+static int try_scanout(struct x12_conn *c, struct x12_surface_state *s,
+                       int have_sprite) {
+    if (!x12_backend->scanout || have_sprite) {
+        return 0;
+    }
+    if (x12_windows_count() != 1 || s->scanned_out) {
+        return 0;
+    }
+    const struct x12_winview *v = x12_windows_at(0);
+    if (v->x != 0 || v->y != 0 || v->width != fb_w || v->height != fb_h) {
+        return 0;
+    }
+    if (!s->has_current || s->current.dmabuf_fd < 0 ||
+        s->current.width != fb_w || s->current.height != fb_h ||
+        s->current.format != X12_FORMAT_XRGB8888) {
+        return 0;
+    }
+    if (s->current_scale != X12_FIXED24P8_ONE || s->current_transform != 0) {
+        return 0;
+    }
+    // a fence the client has not signaled yet would show half drawn
+    // pixels, the composite fallback tolerates that, scanout does not
+    if (s->fence >= 0) {
+        struct pollfd p = { .fd = s->fence, .events = POLLIN };
+        if (poll(&p, 1, 0) != 1) {
+            return 0;
+        }
+    }
+    int slot = -1;
+    for (int i = 0; i < X12_SCANOUT_SLOTS; i++) {
+        if (!so_wait[i].used) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        return 0;
+    }
+    struct x12_scanout_req req = {
+        .dmabuf_fd = s->current.dmabuf_fd,
+        .width = s->current.width,
+        .height = s->current.height,
+        .format = s->current.format,
+        .stride = s->current.stride,
+        .modifier = s->current.modifier,
+        .cookie = (uint32_t)slot,
+    };
+    if (!x12_backend->scanout(&req)) {
+        return 0;
+    }
+    // the frame left through a flip: its retire gives the release
+    // credit away to this session and the screen no longer mirrors
+    // the cpu framebuffer, the next composite repaints everything
+    s->scanned_out = 1;
+    so_wait[slot].used = 1;
+    so_wait[slot].c = c;
+    so_wait[slot].buffer_id = s->current.object;
+    so_wait[slot].token = s->token;
+    so_wait[slot].landed = 0;
+    // the screen went to the client buffer: whatever repaint the stack
+    // owed is paid, the cpu mirror went stale in the same move
+    full_damage = 0;
+    fb_stale = 1;
+    return 1;
+}
+
+// scanout progress from the backend, called once per loop round. the
+// landing carries the scanout moment for the present feedback and the
+// replacement hands the buffer its release credit back
+void x12_comp_scanout_pump(void) {
+    if (!x12_backend->scanout_poll) {
+        return;
+    }
+    struct x12_scanout_event ev;
+    while (x12_backend->scanout_poll(&ev)) {
+        if (ev.cookie >= X12_SCANOUT_SLOTS || !so_wait[ev.cookie].used) {
+            continue;
+        }
+        struct scanout_wait *w = &so_wait[ev.cookie];
+        if (ev.kind == X12_SCANOUT_LANDED) {
+            w->landed = 1;
+            x12_output_present(w->token, X12_OUTPUT_PRESENT_KIND_FLIP, ev.ts);
+        } else if (ev.kind == X12_SCANOUT_REPLACED) {
+            x12_frame_credit(w->c, w->buffer_id);
+            w->used = 0;
+        }
+    }
+}
+
+// a dying connection drops its sessions, the kernel keeps the buffers
+// alive under the flips but the credits go nowhere now
+void x12_comp_scanout_drop(struct x12_conn *c) {
+    for (int i = 0; i < X12_SCANOUT_SLOTS; i++) {
+        if (so_wait[i].used && so_wait[i].c == c) {
+            so_wait[i].used = 0;
+        }
+    }
 }
 
 int x12_comp_pass(struct x12_conn *conns, size_t n) {
@@ -123,6 +247,25 @@ int x12_comp_pass(struct x12_conn *conns, size_t n) {
             damage_add(sview.x, sview.y, sview.w, sview.h);
         }
     }
+    // direct scanout: a single fullscreen dma frame with fresh damage
+    // skips the composite pass and flips to the screen on its own. the
+    // attempt runs before the collect loop eats the damage
+    if (x12_windows_count() == 1) {
+        const struct x12_winview *sv = x12_windows_at(0);
+        struct x12_object *so =
+            x12_objects_get(&sv->client->objects, sv->surface_id);
+        if (so && so->kind == OBJ_SURFACE && so->as.surface.n_current_damage &&
+            try_scanout(sv->client, &so->as.surface, have_sprite)) {
+            // the surface damage was the point of this pass, consume it
+            // exactly like the collect loop would have
+            so->as.surface.n_current_damage = 0;
+            sprite_last = sview;
+            sprite_last_sid = ssid;
+            sprite_drawn = have_sprite;
+            return 1;
+        }
+    }
+
     // collect: every surface gives up its damage to this pass, the
     // compositor is the only consumer so nothing accumulates twice
     for (size_t i = 0; i < n; i++) {
@@ -195,8 +338,11 @@ int x12_comp_pass(struct x12_conn *conns, size_t n) {
     // the damage covers back into the cpu framebuffer afterwards, so
     // the rest of the pipeline sees the same bytes either way
     int gpu = x12_gpu_ready();
-    const struct x12_rect *rects = repaint_all ? &clip : frame_damage;
-    int n_rects = repaint_all ? 1 : n_frame_damage;
+    // a stale fb widens the paint to everything, the screen stopped
+    // mirroring the cpu framebuffer while the scanout owned it
+    int paint_all = repaint_all || fb_stale;
+    const struct x12_rect *rects = paint_all ? &clip : frame_damage;
+    int n_rects = paint_all ? 1 : n_frame_damage;
     int nw = x12_windows_count();
     for (int k = 0; k < n_rects; k++) {
         if (gpu) {
@@ -251,6 +397,7 @@ int x12_comp_pass(struct x12_conn *conns, size_t n) {
         }
     }
     full_damage = 0;
+    fb_stale = 0;
     sprite_last = sview;
     sprite_last_sid = ssid;
     sprite_drawn = have_sprite;

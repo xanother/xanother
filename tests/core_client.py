@@ -14,10 +14,12 @@ from pathlib import Path
 from tests import wire_model as wm
 
 
-def spawn_server(binary, sock_path, extra_args=()):
+def spawn_server(binary, sock_path, extra_args=(), stderr=subprocess.PIPE):
+    # stderr lands in a pipe the caller can read, tests that expect
+    # messages pass an open file to watch them live
     argv = [str(binary), str(sock_path)] + [str(a) for a in extra_args]
     Path(sock_path).unlink(missing_ok=True)
-    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=stderr)
     deadline = time.time() + 10
     while not Path(sock_path).exists():
         if time.time() > deadline or proc.poll() is not None:

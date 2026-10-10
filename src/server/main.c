@@ -39,6 +39,8 @@ static void client_teardown(struct x12_conn *c) {
     // output bindings go with the connection, the fan out skips dead
     // pointers but the slot goes back now
     x12_output_unbind(c);
+    // scanout credits go nowhere now, drop the sessions
+    x12_comp_scanout_drop(c);
     x12_windows_remove_client(c);
     for (uint32_t id = 1; id < X12_MAX_OBJECTS; id++) {
         struct x12_object *o = x12_objects_get(&c->objects, id);
@@ -267,6 +269,9 @@ int main(int argc, char **argv) {
         // pass per loop round keeps the damage accounting single writer
         x12_comp_pass(conns, X12_MAX_CLIENTS);
         x12_backend->pump();
+        // flip landings become present feedback, replacements become
+        // release credits for the buffers that waited on screen
+        x12_comp_scanout_pump();
     }
 
     for (size_t i = 0; i < X12_MAX_CLIENTS; i++) {
