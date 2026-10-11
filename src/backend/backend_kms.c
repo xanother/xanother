@@ -1,11 +1,12 @@
 // Copyright (c) lezginskiy <xanother-x12@proton.me>
 // SPDX-License-Identifier: MIT
 
-// kms backend: drives one real screen over a dumb buffer chain. every
-// present copies the composited canvas into the next chain slot and
-// queues a page flip, the flip completion event lands the frame and
-// frees the slot. the canvas is the staging area, the chain keeps the
-// scanout safe while the compositor redraws
+// kms backend: drives real screens over dumb buffer chains, one chain
+// per output. every present copies the composited canvas into the next
+// slot of the outputs the damage touched and queues a page flip per
+// output, the flip completion event lands the frame and frees the slot.
+// the canvas is the staging area, the chains keep the scanout safe
+// while the compositor redraws
 
 #include <errno.h>
 #include <fcntl.h>
@@ -40,24 +41,57 @@ struct dumb_bo {
 // screen. the flip event names the slot so the progress reporting can
 // tell landed and replaced apart
 struct so_fb {
+    uint32_t magic;  // flip event tag, tells the two flip kinds apart
     int in_use;
     int queued;
+    int out;  // output the buffer scans out on
     uint32_t fb_id;
     uint32_t handle;
     uint32_t cookie;
 };
 
-struct scanout {
-    int fd;
+// one physical head: its connector, its crtc and its own dumb chain.
+// a down head keeps its slot, the neighbours never move
+struct output {
+    uint32_t magic;  // flip event tag
+    int live;
     uint32_t conn_id, crtc_id;
     drmModeModeInfo mode;
+    int32_t x, y;  // position on the global canvas
+    uint32_t mm_w, mm_h;
+    char name[32];
 
     struct dumb_bo slot[2];
     int front;    // slot on screen
     int pending;  // slot queued for the next flip, -1 = none
-    int active;
 };
 
+#define FLIP_MAGIC_OUT 0x4f555450u
+#define FLIP_MAGIC_SO 0x5343414eu
+
+#define X12_OUT_MAX 4
+
+static int card_fd = -1;
+static drmEventContext evctx;
+static struct output outs[X12_OUT_MAX];
+static int n_out_slots;
+static uint32_t used_crtcs[32];
+static int n_used_crtcs;
+
+static struct so_fb so[2];
+static struct so_fb *so_front[X12_OUT_MAX];
+static struct x12_scanout_event so_evq[8];
+static int so_evq_n;
+
+static void push_event(int kind, uint32_t cookie, uint64_t ts, int out) {
+    if (so_evq_n < (int)(sizeof so_evq / sizeof so_evq[0])) {
+        so_evq[so_evq_n].kind = kind;
+        so_evq[so_evq_n].cookie = cookie;
+        so_evq[so_evq_n].ts = ts;
+        so_evq[so_evq_n].out = out;
+        so_evq_n++;
+    }
+}
 
 // dumb buffer lifecycle through the raw drm ioctls
 static int dumb_alloc(int fd, struct dumb_bo *b, uint32_t w, uint32_t h) {
@@ -101,31 +135,13 @@ static void dumb_free(int fd, struct dumb_bo *b) {
     }
 }
 
-static struct scanout sc;
-static const char *ppm_path = "screen.ppm";
-static drmEventContext evctx;
-
-static struct so_fb so[2];
-static struct so_fb *so_front;  // the scanout fb on screen, NULL = dumb
-static struct x12_scanout_event so_evq[8];
-static int so_evq_n;
-
-static void push_event(int kind, uint32_t cookie, uint64_t ts) {
-    if (so_evq_n < (int)(sizeof so_evq / sizeof so_evq[0])) {
-        so_evq[so_evq_n].kind = kind;
-        so_evq[so_evq_n].cookie = cookie;
-        so_evq[so_evq_n].ts = ts;
-        so_evq_n++;
-    }
-}
-
 static void so_free(struct so_fb *b) {
     if (b->fb_id) {
-        drmModeRmFB(sc.fd, b->fb_id);
+        drmModeRmFB(card_fd, b->fb_id);
     }
     if (b->handle) {
         struct drm_gem_close gc = { .handle = b->handle };
-        drmIoctl(sc.fd, DRM_IOCTL_GEM_CLOSE, &gc);
+        drmIoctl(card_fd, DRM_IOCTL_GEM_CLOSE, &gc);
     }
     b->fb_id = 0;
     b->handle = 0;
@@ -133,50 +149,263 @@ static void so_free(struct so_fb *b) {
     b->queued = 0;
 }
 
+static int mode_millihz(const drmModeModeInfo *m) {
+    if (!m->htotal || !m->vtotal) {
+        return 0;
+    }
+    return (int)((uint64_t)m->clock * 1000000ull /
+                 ((uint64_t)m->htotal * m->vtotal));
+}
+
+// the kernel name pattern for a connector: type letter run plus the
+// type id, the same spelling the drm sysfs tree uses
+static const char *type_name(uint32_t type) {
+    switch (type) {
+    case DRM_MODE_CONNECTOR_VGA: return "VGA";
+    case DRM_MODE_CONNECTOR_DVII: return "DVI-I";
+    case DRM_MODE_CONNECTOR_DVID: return "DVI-D";
+    case DRM_MODE_CONNECTOR_DVIA: return "DVI-A";
+    case DRM_MODE_CONNECTOR_Composite: return "Composite";
+    case DRM_MODE_CONNECTOR_SVIDEO: return "SVIDEO";
+    case DRM_MODE_CONNECTOR_LVDS: return "LVDS";
+    case DRM_MODE_CONNECTOR_Component: return "Component";
+    case DRM_MODE_CONNECTOR_9PinDIN: return "DIN";
+    case DRM_MODE_CONNECTOR_DisplayPort: return "DP";
+    case DRM_MODE_CONNECTOR_HDMIA: return "HDMI-A";
+    case DRM_MODE_CONNECTOR_HDMIB: return "HDMI-B";
+    case DRM_MODE_CONNECTOR_TV: return "TV";
+    case DRM_MODE_CONNECTOR_eDP: return "eDP";
+    case DRM_MODE_CONNECTOR_DSI: return "DSI";
+    case DRM_MODE_CONNECTOR_DPI: return "DPI";
+    case DRM_MODE_CONNECTOR_WRITEBACK: return "Writeback";
+    case DRM_MODE_CONNECTOR_SPI: return "SPI";
+    case DRM_MODE_CONNECTOR_USB: return "USB";
+    default: return "Virtual";
+    }
+}
+
+static void fill_black(struct dumb_bo *b, uint32_t w, uint32_t h) {
+    for (uint32_t y = 0; y < h; y++) {
+        memset((uint8_t *)b->map + (size_t)y * b->pitch, 0, (size_t)w * 4);
+    }
+}
+
+// a connector takes a crtc no other head drives. the encoder behind it
+// names the candidates, the bit mask keeps the picks apart
+static uint32_t pick_crtc(drmModeRes *res, const drmModeConnector *conn) {
+    if (conn->encoder_id) {
+        drmModeEncoder *enc = drmModeGetEncoder(card_fd, conn->encoder_id);
+        if (enc) {
+            uint32_t id = enc->crtc_id;
+            drmModeFreeEncoder(enc);
+            for (int i = 0; i < n_used_crtcs; i++) {
+                if (used_crtcs[i] == id) {
+                    return 0;
+                }
+            }
+            if (id) {
+                return id;
+            }
+        }
+    }
+    for (int e = 0; e < conn->count_encoders; e++) {
+        drmModeEncoder *ce = drmModeGetEncoder(card_fd, conn->encoders[e]);
+        if (!ce) {
+            continue;
+        }
+        uint32_t id = 0;
+        for (int c = 0; c < res->count_crtcs; c++) {
+            if (!(ce->possible_crtcs & (1u << c))) {
+                continue;
+            }
+            int used = 0;
+            for (int i = 0; i < n_used_crtcs; i++) {
+                if (used_crtcs[i] == res->crtcs[c]) {
+                    used = 1;
+                    break;
+                }
+            }
+            if (!used) {
+                id = res->crtcs[c];
+                break;
+            }
+        }
+        drmModeFreeEncoder(ce);
+        if (id) {
+            return id;
+        }
+    }
+    return 0;
+}
+
+// claims a free slot for one connected connector and arms its chain.
+// returns the slot or -1 when nothing is free or usable
+static int output_bring_up(drmModeRes *res, uint32_t conn_id) {
+    drmModeConnector *conn = drmModeGetConnector(card_fd, conn_id);
+    if (!conn) {
+        return -1;
+    }
+    if (conn->connection != DRM_MODE_CONNECTED || conn->count_modes == 0 ||
+        conn->connector_type == DRM_MODE_CONNECTOR_WRITEBACK) {
+        drmModeFreeConnector(conn);
+        return -1;
+    }
+    uint32_t crtc_id = pick_crtc(res, conn);
+    if (!crtc_id) {
+        drmModeFreeConnector(conn);
+        return -1;
+    }
+    int idx = -1;
+    for (int i = 0; i < X12_OUT_MAX; i++) {
+        if (!outs[i].live && outs[i].conn_id == 0) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx < 0 && n_out_slots < X12_OUT_MAX) {
+        idx = n_out_slots;
+    }
+    if (idx < 0) {
+        drmModeFreeConnector(conn);
+        return -1;
+    }
+    struct output *o = &outs[idx];
+    memset(o, 0, sizeof *o);
+    o->magic = FLIP_MAGIC_OUT;
+    o->conn_id = conn_id;
+    o->crtc_id = crtc_id;
+    o->mode = conn->modes[0];
+    o->mm_w = conn->mmWidth;
+    o->mm_h = conn->mmHeight;
+    snprintf(o->name, sizeof o->name, "%s-%u", type_name(conn->connector_type),
+             conn->connector_type_id);
+    drmModeFreeConnector(conn);
+    if (idx >= n_out_slots) {
+        n_out_slots = idx + 1;
+    }
+    if (n_used_crtcs < (int)(sizeof used_crtcs / sizeof used_crtcs[0])) {
+        used_crtcs[n_used_crtcs++] = crtc_id;
+    }
+    // outputs tile left to right at y zero, a fresh head takes the next
+    // free place on the right edge of what is already there
+    int32_t x = 0;
+    for (int i = 0; i < n_out_slots; i++) {
+        if (i != idx && outs[i].live &&
+            outs[i].x + (int32_t)outs[i].mode.hdisplay > x) {
+            x = outs[i].x + (int32_t)outs[i].mode.hdisplay;
+        }
+    }
+    o->x = x;
+    o->y = 0;
+
+    uint32_t w = o->mode.hdisplay, h = o->mode.vdisplay;
+    for (int i = 0; i < 2; i++) {
+        if (dumb_alloc(card_fd, &o->slot[i], w, h) != 0) {
+            fprintf(stderr, "kms backend: dumb buffer refused on %s\n",
+                    o->name);
+            for (int k = 0; k < i; k++) {
+                dumb_free(card_fd, &o->slot[k]);
+            }
+            o->conn_id = 0;
+            o->magic = 0;
+            return -1;
+        }
+        fill_black(&o->slot[i], w, h);
+    }
+    if (drmModeSetCrtc(card_fd, o->crtc_id, o->slot[0].fb_id, 0, 0,
+                       &o->conn_id, 1, &o->mode) != 0) {
+        fprintf(stderr, "kms backend: set crtc refused on %s: %s\n", o->name,
+                strerror(errno));
+        for (int k = 0; k < 2; k++) {
+            dumb_free(card_fd, &o->slot[k]);
+        }
+        o->conn_id = 0;
+        o->magic = 0;
+        return -1;
+    }
+    o->front = 0;
+    o->pending = -1;
+    o->live = 1;
+    return idx;
+}
+
+// the bounding box of every live head, the canvas the compositor draws
+void x12_kms_bbox(uint32_t *w, uint32_t *h) {
+    uint32_t cw = 0, ch = 0;
+    for (int i = 0; i < n_out_slots; i++) {
+        if (!outs[i].live) {
+            continue;
+        }
+        if ((uint32_t)outs[i].x + outs[i].mode.hdisplay > cw) {
+            cw = (uint32_t)outs[i].x + outs[i].mode.hdisplay;
+        }
+        if ((uint32_t)outs[i].y + outs[i].mode.vdisplay > ch) {
+            ch = (uint32_t)outs[i].y + outs[i].mode.vdisplay;
+        }
+    }
+    *w = cw;
+    *h = ch;
+}
+
 static void flip_handler(int fd, unsigned int seq, unsigned int tv_sec,
                          unsigned int tv_usec, void *user) {
     (void)fd;
     (void)seq;
     uint64_t ts = (uint64_t)tv_sec * 1000000000ull + (uint64_t)tv_usec * 1000ull;
-    struct so_fb *landed = user;
-    // whatever the screen showed before this landing is gone now, a
-    // scanout buffer that leaves gets its replacement reported so the
-    // release credit can go home
-    if (so_front && so_front != landed) {
-        push_event(X12_SCANOUT_REPLACED, so_front->cookie, ts);
-        so_free(so_front);
-        so_front = 0;
+    if (!user) {
+        return;
     }
-    if (landed) {
+    struct so_fb *probe = user;
+    if (probe->magic == FLIP_MAGIC_SO) {
+        struct so_fb *landed = user;
+        int out = landed->out;
+        // whatever this output showed before this landing is gone now,
+        // a scanout buffer that leaves gets its replacement reported so
+        // the release credit can go home
+        if (so_front[out] && so_front[out] != landed) {
+            push_event(X12_SCANOUT_REPLACED, so_front[out]->cookie, ts, out);
+            so_free(so_front[out]);
+            so_front[out] = 0;
+        }
         // the client buffer hit the screen, the flip moment is the
         // scanout time the present feedback reports
         landed->queued = 0;
-        push_event(X12_SCANOUT_LANDED, landed->cookie, ts);
-        so_front = landed;
+        push_event(X12_SCANOUT_LANDED, landed->cookie, ts, out);
+        so_front[out] = landed;
         return;
     }
     // a dumb chain slot just landed on screen, the chain is free again
-    if (sc.pending >= 0) {
-        sc.front = sc.pending;
-        sc.pending = -1;
+    // and whatever scanned out on that head is replaced
+    struct output *o = user;
+    int oi = (int)(o - outs);
+    if (o->pending >= 0) {
+        o->front = o->pending;
+        o->pending = -1;
+    }
+    if (oi >= 0 && oi < X12_OUT_MAX && so_front[oi]) {
+        push_event(X12_SCANOUT_REPLACED, so_front[oi]->cookie, ts, oi);
+        so_free(so_front[oi]);
+        so_front[oi] = 0;
     }
 }
 
 static void drain_flip_events(void) {
-    struct pollfd p = { .fd = sc.fd, .events = POLLIN };
+    struct pollfd p = { .fd = card_fd, .events = POLLIN };
     while (poll(&p, 1, 0) > 0 && (p.revents & POLLIN)) {
-        if (drmHandleEvent(sc.fd, &evctx) != 0) {
+        if (drmHandleEvent(card_fd, &evctx) != 0) {
             return;
         }
     }
 }
 
-static int flip_busy(void) {
-    if (sc.pending >= 0) {
+// one flip in flight per head, a second frame must wait its turn
+static int out_busy(const struct output *o) {
+    if (o->pending >= 0) {
         return 1;
     }
+    int oi = (int)(o - outs);
     for (int i = 0; i < 2; i++) {
-        if (so[i].queued) {
+        if (so[i].in_use && so[i].queued && so[i].out == oi) {
             return 1;
         }
     }
@@ -185,20 +414,20 @@ static int flip_busy(void) {
 
 // waits until the queued flip lands or the screen proves dead. the
 // chain only holds two slots, a third frame must not race the flip
-static void wait_pending(void) {
-    for (int spin = 0; flip_busy() && spin < 64; spin++) {
-        struct pollfd p = { .fd = sc.fd, .events = POLLIN };
+static void out_wait(struct output *o) {
+    for (int spin = 0; out_busy(o) && spin < 64; spin++) {
+        struct pollfd p = { .fd = card_fd, .events = POLLIN };
         if (poll(&p, 1, 100) <= 0) {
             break;
         }
-        if (drmHandleEvent(sc.fd, &evctx) != 0) {
+        if (drmHandleEvent(card_fd, &evctx) != 0) {
             break;
         }
     }
-    if (sc.pending >= 0) {
+    if (o->pending >= 0) {
         // the flip never reported, keep the chain moving anyway
-        sc.front = sc.pending;
-        sc.pending = -1;
+        o->front = o->pending;
+        o->pending = -1;
     }
 }
 
@@ -213,134 +442,93 @@ static int kms_init(int argc, char **argv) {
         fprintf(stderr, "x12-server: --kms needs a drm node\n");
         return -1;
     }
-    sc.fd = open(node, O_RDWR | O_CLOEXEC);
-    if (sc.fd < 0) {
+    card_fd = open(node, O_RDWR | O_CLOEXEC);
+    if (card_fd < 0) {
         fprintf(stderr, "x12-server: cannot open drm node %s: %s\n", node,
                 strerror(errno));
         return -1;
     }
-    if (drmSetMaster(sc.fd) != 0) {
+    if (drmSetMaster(card_fd) != 0) {
         fprintf(stderr,
                 "x12-server: no drm master on %s, a session still owns it: "
                 "%s\n",
                 node, strerror(errno));
-        close(sc.fd);
-        sc.fd = -1;
+        close(card_fd);
+        card_fd = -1;
         return -1;
     }
 
-    // first connected connector keeps its current mode, the encoder
-    // behind it names the crtc to drive
-    drmModeRes *res = drmModeGetResources(sc.fd);
+    // every connected connector claims a crtc and a chain, the heads
+    // tile left to right in scan order
+    drmModeRes *res = drmModeGetResources(card_fd);
     if (!res) {
         goto fail;
     }
-    int found = 0;
-    for (int i = 0; i < res->count_connectors && !found; i++) {
-        drmModeConnector *conn =
-            drmModeGetConnector(sc.fd, res->connectors[i]);
-        if (!conn) {
-            continue;
-        }
-        if (conn->connection == DRM_MODE_CONNECTED && conn->count_modes > 0) {
-            sc.conn_id = conn->connector_id;
-            sc.mode = conn->modes[0];
-            drmModeEncoder *enc = NULL;
-            if (conn->encoder_id) {
-                enc = drmModeGetEncoder(sc.fd, conn->encoder_id);
-            }
-            if (enc) {
-                sc.crtc_id = enc->crtc_id;
-                drmModeFreeEncoder(enc);
-            } else {
-                for (int e = 0; e < conn->count_encoders; e++) {
-                    drmModeEncoder *ce =
-                        drmModeGetEncoder(sc.fd, conn->encoders[e]);
-                    if (!ce) {
-                        continue;
-                    }
-                    for (int c = 0; c < res->count_crtcs; c++) {
-                        if (ce->possible_crtcs & (1u << c)) {
-                            sc.crtc_id = res->crtcs[c];
-                            break;
-                        }
-                    }
-                    drmModeFreeEncoder(ce);
-                    if (sc.crtc_id) {
-                        break;
-                    }
-                }
-            }
-            found = sc.crtc_id != 0;
-        }
-        drmModeFreeConnector(conn);
+    for (int i = 0; i < res->count_connectors && n_out_slots < X12_OUT_MAX;
+         i++) {
+        output_bring_up(res, res->connectors[i]);
     }
     drmModeFreeResources(res);
-    if (!found) {
+    if (n_out_slots == 0) {
         fprintf(stderr,
                 "x12-server: no usable connector with a live crtc on %s\n",
                 node);
         goto fail;
     }
 
-    // two dumb buffers, the chain of the party
-    uint32_t w = sc.mode.hdisplay, h = sc.mode.vdisplay;
-    for (int i = 0; i < 2; i++) {
-        if (dumb_alloc(sc.fd, &sc.slot[i], w, h) != 0) {
-            fprintf(stderr, "x12-server: dumb buffer %d failed\n", i);
-            goto fail;
-        }
-    }
-
-    // take over the crtc with the first slot, the chain starts here
-    if (drmModeSetCrtc(sc.fd, sc.crtc_id, sc.slot[0].fb_id, 0, 0, &sc.conn_id,
-                       1, &sc.mode) != 0) {
-        fprintf(stderr, "x12-server: set crtc failed on %s: %s\n", node,
-                strerror(errno));
-        goto fail;
-    }
-    sc.front = 0;
-    sc.pending = -1;
-    sc.active = 1;
-
     memset(&evctx, 0, sizeof evctx);
     evctx.version = DRM_EVENT_CONTEXT_VERSION;
     evctx.page_flip_handler = flip_handler;
 
-    // the output global reports the real screen from here on
-    static char name[32];
-    snprintf(name, sizeof name, "X12-KMS-%u", sc.conn_id);
-    x12_output_info(w, h, (uint32_t)(sc.mode.vrefresh * 1000u), name);
     return 0;
 
 fail:
-    for (int i = 0; i < 2; i++) {
-        dumb_free(sc.fd, &sc.slot[i]);
+    for (int i = 0; i < X12_OUT_MAX; i++) {
+        for (int k = 0; k < 2; k++) {
+            dumb_free(card_fd, &outs[i].slot[k]);
+        }
+        outs[i].conn_id = 0;
     }
-    drmDropMaster(sc.fd);
-    close(sc.fd);
-    sc.fd = -1;
+    n_out_slots = 0;
+    if (card_fd >= 0) {
+        drmDropMaster(card_fd);
+        close(card_fd);
+        card_fd = -1;
+    }
     return -1;
 }
 
 static void kms_destroy(void) {
-    if (sc.fd < 0) {
+    if (card_fd < 0) {
         return;
     }
-    wait_pending();
+    for (int i = 0; i < X12_OUT_MAX; i++) {
+        struct output *o = &outs[i];
+        if (o->live) {
+            out_wait(o);
+        }
+        for (int k = 0; k < 2; k++) {
+            dumb_free(card_fd, &o->slot[k]);
+        }
+        if (o->live && o->crtc_id) {
+            drmModeSetCrtc(card_fd, o->crtc_id, 0, 0, 0, NULL, 0, NULL);
+        }
+        o->live = 0;
+        o->conn_id = 0;
+    }
     for (int i = 0; i < 2; i++) {
-        dumb_free(sc.fd, &sc.slot[i]);
         so_free(&so[i]);
     }
-    so_front = 0;
-    drmDropMaster(sc.fd);
-    close(sc.fd);
-    sc.fd = -1;
+    for (int i = 0; i < X12_OUT_MAX; i++) {
+        so_front[i] = 0;
+    }
+    drmDropMaster(card_fd);
+    close(card_fd);
+    card_fd = -1;
 }
 
 static void kms_get_size(uint32_t *w, uint32_t *h) {
-    *w = sc.mode.hdisplay;
-    *h = sc.mode.vdisplay;
+    x12_kms_bbox(w, h);
 }
 
 static void write_ppm(const char *path, const uint32_t *fb, uint32_t w,
@@ -361,44 +549,113 @@ static void write_ppm(const char *path, const uint32_t *fb, uint32_t w,
 
 static void kms_present(const uint32_t *fb, const struct x12_rect *rects,
                         int n_rects) {
-    // damage rects are advisory here, the dumb chain copies the whole
-    // staging canvas, correctness does not depend on the damage math
-    (void)rects;
-    (void)n_rects;
-    if (!sc.active) {
-        write_ppm(ppm_path, fb, sc.mode.hdisplay, sc.mode.vdisplay);
-        return;
+    uint32_t cw = 0, ch = 0;
+    x12_kms_bbox(&cw, &ch);
+    int flipped = 0;
+    for (int oi = 0; oi < n_out_slots; oi++) {
+        struct output *o = &outs[oi];
+        if (!o->live) {
+            continue;
+        }
+        // only the outputs the damage touched flip, the rest keep
+        // showing the frame they already have
+        int dirty = 0;
+        for (int k = 0; k < n_rects && !dirty; k++) {
+            int64_t x0 = rects[k].x > o->x ? rects[k].x : o->x;
+            int64_t y0 = rects[k].y > o->y ? rects[k].y : o->y;
+            int64_t x1 = rects[k].x + (int64_t)rects[k].w;
+            int64_t y1 = rects[k].y + (int64_t)rects[k].h;
+            if (x1 > o->x + (int64_t)o->mode.hdisplay) {
+                x1 = o->x + (int64_t)o->mode.hdisplay;
+            }
+            if (y1 > o->y + (int64_t)o->mode.vdisplay) {
+                y1 = o->y + (int64_t)o->mode.vdisplay;
+            }
+            dirty = x1 > x0 && y1 > y0;
+        }
+        if (!dirty) {
+            continue;
+        }
+        if (out_busy(o)) {
+            // the previous flip has not landed, its slot must stay put
+            out_wait(o);
+        }
+        // the flip goes to the slot the screen is not reading
+        int cur = 1 - o->front;
+        struct dumb_bo *bo = &o->slot[cur];
+        if (!bo->map) {
+            continue;
+        }
+        // the canvas packs rows at its own width, the dumb pitch is
+        // bytes, the copy runs row by row so both stay honest
+        uint32_t w = o->mode.hdisplay, h = o->mode.vdisplay;
+        for (uint32_t y = 0; y < h; y++) {
+            const uint8_t *src =
+                (const uint8_t *)fb +
+                ((size_t)(o->y + (int32_t)y) * cw + (size_t)o->x) * 4;
+            memcpy((uint8_t *)bo->map + (size_t)y * bo->pitch, src,
+                   (size_t)w * 4);
+        }
+        if (drmModePageFlip(card_fd, o->crtc_id, bo->fb_id,
+                            DRM_MODE_PAGE_FLIP_EVENT, o) != 0) {
+            fprintf(stderr, "x12-server: page flip failed on %s: %s\n",
+                    o->name, strerror(errno));
+            continue;
+        }
+        o->pending = cur;
+        flipped = 1;
     }
-    if (sc.pending >= 0) {
-        // the previous flip has not landed, its slot must stay put
-        wait_pending();
+    if (!flipped) {
+        // nothing live to show it on, keep the pixels around for the
+        // test tools instead of dropping them silently
+        write_ppm("screen.ppm", fb, cw, ch);
     }
+}
 
-    // the flip goes to the slot the screen is not reading
-    int cur = 1 - sc.front;
-    struct dumb_bo *bo = &sc.slot[cur];
-    if (!bo->map) {
-        return;
-    }
-    // the canvas packs rows at its own width, the dumb pitch is bytes,
-    // the copy runs row by row so different pitches stay honest
-    size_t row_bytes = (size_t)sc.mode.hdisplay * 4;
-    for (uint32_t y = 0; y < sc.mode.vdisplay; y++) {
-        memcpy((uint8_t *)bo->map + (size_t)y * bo->pitch,
-               (const uint8_t *)fb + (size_t)y * row_bytes, row_bytes);
-    }
+static int kms_output_count(void) {
+    return n_out_slots;
+}
 
-    if (drmModePageFlip(sc.fd, sc.crtc_id, bo->fb_id,
-                        DRM_MODE_PAGE_FLIP_EVENT, NULL) != 0) {
-        fprintf(stderr, "x12-server: page flip failed: %s\n",
-                strerror(errno));
-        return;
+static int kms_output_info(int out, struct x12_out_info *info) {
+    if (out < 0 || out >= n_out_slots || !outs[out].live) {
+        return 0;
     }
-    sc.pending = cur;
+    struct output *o = &outs[out];
+    info->x = o->x;
+    info->y = o->y;
+    info->width = o->mode.hdisplay;
+    info->height = o->mode.vdisplay;
+    info->mm_width = o->mm_w;
+    info->mm_height = o->mm_h;
+    info->refresh_millihz = (uint32_t)mode_millihz(&o->mode);
+    info->name = o->name;
+    info->live = 1;
+    return 1;
+}
+
+static int kms_output_vrr(int out, uint32_t *min_millihz,
+                          uint32_t *max_millihz) {
+    (void)out;
+    (void)min_millihz;
+    (void)max_millihz;
+    // vrr capability lands with the hardware parties
+    return 0;
+}
+
+static int kms_set_vrr(int out, int enable) {
+    (void)out;
+    (void)enable;
+    return -1;
+}
+
+static int kms_output_poll(struct x12_output_event *ev) {
+    (void)ev;
+    // hotplug lands with the hardware parties
+    return 0;
 }
 
 static void kms_pump(void) {
-    // flip completions land here every loop turn and free the chain
+    // flip completions land here every loop turn and free the chains
     drain_flip_events();
 }
 
@@ -407,13 +664,17 @@ static int kms_halt_requested(void) {
 }
 
 static int kms_scanout(const struct x12_scanout_req *req) {
-    if (!sc.active || !req || req->dmabuf_fd < 0) {
+    if (!req || req->dmabuf_fd < 0) {
         return 0;
     }
-    if (flip_busy()) {
-        wait_pending();
+    if (req->out < 0 || req->out >= n_out_slots || !outs[req->out].live) {
+        return 0;
     }
-    if (flip_busy()) {
+    struct output *o = &outs[req->out];
+    if (out_busy(o)) {
+        out_wait(o);
+    }
+    if (out_busy(o)) {
         // a flip never reported, the caller composites this round
         return 0;
     }
@@ -430,7 +691,7 @@ static int kms_scanout(const struct x12_scanout_req *req) {
     // the client buffer becomes a gem handle on this device and an fb
     // the crtc can flip to directly, no copy anywhere
     uint32_t handle = 0;
-    if (drmPrimeFDToHandle(sc.fd, req->dmabuf_fd, &handle) != 0) {
+    if (drmPrimeFDToHandle(card_fd, req->dmabuf_fd, &handle) != 0) {
         return 0;
     }
     uint32_t handles[4] = { handle, 0, 0, 0 };
@@ -440,30 +701,32 @@ static int kms_scanout(const struct x12_scanout_req *req) {
     int rc;
     if (req->modifier && req->modifier != DRM_FORMAT_MOD_INVALID) {
         uint64_t mods[4] = { req->modifier, 0, 0, 0 };
-        rc = drmModeAddFB2WithModifiers(sc.fd, req->width, req->height,
+        rc = drmModeAddFB2WithModifiers(card_fd, req->width, req->height,
                                         req->format, handles, pitches,
                                         offsets, mods, &fb_id,
                                         DRM_MODE_FB_MODIFIERS);
     } else {
-        rc = drmModeAddFB2(sc.fd, req->width, req->height, req->format,
+        rc = drmModeAddFB2(card_fd, req->width, req->height, req->format,
                            handles, pitches, offsets, &fb_id, 0);
     }
     if (rc != 0) {
         struct drm_gem_close gc = { .handle = handle };
-        drmIoctl(sc.fd, DRM_IOCTL_GEM_CLOSE, &gc);
+        drmIoctl(card_fd, DRM_IOCTL_GEM_CLOSE, &gc);
         return 0;
     }
-    if (drmModePageFlip(sc.fd, sc.crtc_id, fb_id, DRM_MODE_PAGE_FLIP_EVENT,
+    if (drmModePageFlip(card_fd, o->crtc_id, fb_id, DRM_MODE_PAGE_FLIP_EVENT,
                         b) != 0) {
-        fprintf(stderr, "x12-server: scanout flip failed: %s\n",
-                strerror(errno));
-        drmModeRmFB(sc.fd, fb_id);
+        fprintf(stderr, "x12-server: scanout flip failed on %s: %s\n",
+                o->name, strerror(errno));
+        drmModeRmFB(card_fd, fb_id);
         struct drm_gem_close gc = { .handle = handle };
-        drmIoctl(sc.fd, DRM_IOCTL_GEM_CLOSE, &gc);
+        drmIoctl(card_fd, DRM_IOCTL_GEM_CLOSE, &gc);
         return 0;
     }
+    b->magic = FLIP_MAGIC_SO;
     b->in_use = 1;
     b->queued = 1;
+    b->out = req->out;
     b->fb_id = fb_id;
     b->handle = handle;
     b->cookie = req->cookie;
@@ -486,6 +749,11 @@ const struct x12_backend_ops x12_backend_kms = {
     .init = kms_init,
     .get_size = kms_get_size,
     .present = kms_present,
+    .output_count = kms_output_count,
+    .output_info = kms_output_info,
+    .output_vrr = kms_output_vrr,
+    .set_vrr = kms_set_vrr,
+    .output_poll = kms_output_poll,
     .pump = kms_pump,
     .halt_requested = kms_halt_requested,
     .shutdown = kms_destroy,

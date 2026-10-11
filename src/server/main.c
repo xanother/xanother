@@ -110,9 +110,24 @@ int main(int argc, char **argv) {
     }
     uint32_t canvas_w = 0, canvas_h = 0;
     x12_backend->get_size(&canvas_w, &canvas_h);
-    // the output global reports the real canvas, a hardware backend may
-    // have set its own name and refresh during init already
-    x12_output_info(canvas_w, canvas_h, 0, NULL);
+    // the output globals report the real screens the backend drives
+    for (int i = 0; i < x12_backend->output_count(); i++) {
+        struct x12_out_info oi;
+        struct x12_output_desc d;
+        if (!x12_backend->output_info(i, &oi)) {
+            continue;
+        }
+        memset(&d, 0, sizeof d);
+        snprintf(d.name, sizeof d.name, "%s", oi.name ? oi.name : "X12");
+        d.x = oi.x;
+        d.y = oi.y;
+        d.w = oi.width;
+        d.h = oi.height;
+        d.mm_w = oi.mm_width;
+        d.mm_h = oi.mm_height;
+        d.refresh_millihz = oi.refresh_millihz;
+        x12_output_set(i, &d);
+    }
     x12_comp_set_size(canvas_w, canvas_h);
     x12_windows_init();
     x12_windows_set_output(canvas_w, canvas_h);

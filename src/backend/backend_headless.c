@@ -72,6 +72,44 @@ static void present(const uint32_t *fb, const struct x12_rect *rects,
     fclose(f);
 }
 
+static int output_count(void) {
+    return 1;
+}
+
+static int output_info(int out, struct x12_out_info *info) {
+    if (out != 0) {
+        return 0;
+    }
+    info->x = 0;
+    info->y = 0;
+    info->width = canvas_w;
+    info->height = canvas_h;
+    info->mm_width = 0;
+    info->mm_height = 0;
+    info->refresh_millihz = 60000;
+    info->name = "X12-1";
+    info->live = 1;
+    return 1;
+}
+
+static int output_vrr(int out, uint32_t *min_millihz, uint32_t *max_millihz) {
+    (void)out;
+    (void)min_millihz;
+    (void)max_millihz;
+    return 0;
+}
+
+static int set_vrr(int out, int enable) {
+    (void)out;
+    (void)enable;
+    return -1;
+}
+
+static int output_poll(struct x12_output_event *ev) {
+    (void)ev;
+    return 0;
+}
+
 static void pump(void) {
 }
 
@@ -86,6 +124,11 @@ const struct x12_backend_ops x12_backend_headless = {
     .init = init,
     .get_size = get_size,
     .present = present,
+    .output_count = output_count,
+    .output_info = output_info,
+    .output_vrr = output_vrr,
+    .set_vrr = set_vrr,
+    .output_poll = output_poll,
     .pump = pump,
     .halt_requested = halt_requested,
     .shutdown = shutdown,

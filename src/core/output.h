@@ -12,12 +12,25 @@
 // feedback. every client that binds the global hears every present, the
 // commit token tells it which of its own frames reached the screen
 
-// startup description of the one screen the server drives
-void x12_output_info(uint32_t w, uint32_t h, uint32_t refresh_millihz,
-                     const char *name);
+// the screen slots the server drives, slot indexes are the output
+// identities the protocol instance numbers name. they never renumber,
+// a down head leaves a hole instead of shifting its neighbours
+#define X12_OUTPUT_SLOTS 8
 
-void x12_output_describe(uint32_t *w, uint32_t *h, uint32_t *refresh_millihz,
-                         const char **name);
+struct x12_output_desc {
+    char name[32];
+    int32_t x, y;
+    uint32_t w, h;
+    uint32_t mm_w, mm_h;
+    uint32_t refresh_millihz;
+    int live;
+};
+
+// startup and hotplug description of one screen slot
+void x12_output_set(int slot, const struct x12_output_desc *d);
+void x12_output_drop(int slot);
+int x12_output_describe(int slot, struct x12_output_desc *d);
+int x12_output_count(void);
 
 // the registry bind and the teardown path
 void x12_output_bind(struct x12_conn *c, uint32_t id);

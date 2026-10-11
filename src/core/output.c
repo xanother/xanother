@@ -12,28 +12,39 @@ static struct {
     uint32_t id;
 } bindings[X12_MAX_CLIENTS];
 
-static uint32_t info_w, info_h, info_refresh = 60000;
-static char info_name[32] = "X12-1";
+static struct x12_output_desc slots[X12_OUTPUT_SLOTS];
 
-void x12_output_info(uint32_t w, uint32_t h, uint32_t refresh_millihz,
-                     const char *name) {
-    info_w = w;
-    info_h = h;
-    if (refresh_millihz) {
-        info_refresh = refresh_millihz;
+void x12_output_set(int slot, const struct x12_output_desc *d) {
+    if (slot < 0 || slot >= X12_OUTPUT_SLOTS || !d) {
+        return;
     }
-    if (name && name[0]) {
-        strncpy(info_name, name, sizeof info_name - 1);
-        info_name[sizeof info_name - 1] = 0;
-    }
+    slots[slot] = *d;
+    slots[slot].live = 1;
 }
 
-void x12_output_describe(uint32_t *w, uint32_t *h, uint32_t *refresh_millihz,
-                         const char **name) {
-    *w = info_w;
-    *h = info_h;
-    *refresh_millihz = info_refresh;
-    *name = info_name;
+void x12_output_drop(int slot) {
+    if (slot < 0 || slot >= X12_OUTPUT_SLOTS) {
+        return;
+    }
+    slots[slot].live = 0;
+}
+
+int x12_output_describe(int slot, struct x12_output_desc *d) {
+    if (slot < 0 || slot >= X12_OUTPUT_SLOTS || !slots[slot].live || !d) {
+        return 0;
+    }
+    *d = slots[slot];
+    return 1;
+}
+
+int x12_output_count(void) {
+    int n = 0;
+    for (int i = 0; i < X12_OUTPUT_SLOTS; i++) {
+        if (slots[i].live) {
+            n++;
+        }
+    }
+    return n;
 }
 
 void x12_output_bind(struct x12_conn *c, uint32_t id) {
