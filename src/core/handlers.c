@@ -73,9 +73,20 @@ static int handle_hello(struct x12_conn *c, uint32_t object, const x12_arg *args
     }
     // the client learns the global set from registry.global events, one
     // per advertised instance
-    const x12_iface_desc *reg = x12_iface_find("x12_registry");
     for (size_t i = 0; i < sizeof bind_rules / sizeof bind_rules[0]; i++) {
         const struct bind_rule *r = &bind_rules[i];
+        if (r->kind == OBJ_OUTPUT) {
+            for (int s = 0; s < X12_OUTPUT_SLOTS; s++) {
+                if (!x12_output_describe(s, 0)) {
+                    continue;
+                }
+                if (x12_announce_output(c, (uint32_t)s) != 0) {
+                    return -1;
+                }
+            }
+            continue;
+        }
+        const x12_iface_desc *reg = x12_iface_find("x12_registry");
         x12_arg g[4] = {
             { .str = r->name, .str_len = (uint32_t)strlen(r->name) },
             { .u64 = x12_iface_find(r->name)->version },
@@ -87,6 +98,20 @@ static int handle_hello(struct x12_conn *c, uint32_t object, const x12_arg *args
         }
     }
     return 0;
+}
+
+// one registry.global for one output instance, hello sends the whole
+// set and hotplug adds late arrivals the same way
+int x12_announce_output(struct x12_conn *c, uint32_t instance) {
+    const struct bind_rule *rule = rule_by_name("x12_output");
+    const x12_iface_desc *reg = x12_iface_find("x12_registry");
+    x12_arg g[4] = {
+        { .str = "x12_output", .str_len = 10 },
+        { .u64 = x12_iface_find("x12_output")->version },
+        { .u64 = rule->required_cap },
+        { .u64 = instance },
+    };
+    return x12_conn_event(c, reg, "global", X12_OBJ_ID_REGISTRY, g, 4);
 }
 
 static int handle_sync(struct x12_conn *c, uint32_t object, const x12_arg *args) {
@@ -138,8 +163,16 @@ static int handle_bind(struct x12_conn *c, uint32_t object, const x12_arg *args)
         return 0;
     }
     // only repeated globals care about the instance selector, the
-    // skeleton advertises singletons only
-    if (args[3].u64 != 0) {
+    // singletons refuse anything above zero and the outputs name the
+    // screen slot they describe
+    uint32_t instance = (uint32_t)args[3].u64;
+    if (rule->kind == OBJ_OUTPUT) {
+        if (args[3].u64 >= X12_OUTPUT_SLOTS ||
+            !x12_output_describe((int)instance, 0)) {
+            x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
+            return 0;
+        }
+    } else if (instance != 0) {
         x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
         return 0;
     }
@@ -153,11 +186,11 @@ static int handle_bind(struct x12_conn *c, uint32_t object, const x12_arg *args)
     // presentation feedback fan out
     if (rule->kind == OBJ_OUTPUT) {
         struct x12_output_desc d;
-        if (!x12_output_describe(0, &d)) {
+        if (!x12_output_describe((int)instance, &d)) {
             x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
             return 0;
         }
-        x12_output_bind(c, id);
+        x12_output_bind(c, id, (int)instance);
         const x12_iface_desc *oi = x12_iface_find("x12_output");
         // the one mode the screen runs is both current and preferred,
         // the enum can only say one thing so it names the truth a user
@@ -226,7 +259,7 @@ int x12_handle_output(struct x12_conn *c, uint32_t object,
                       const x12_msg_desc *msg, const x12_arg *args) {
     (void)args;
     if (strcmp(msg->name, "release") == 0) {
-        x12_output_unbind(c);
+        x12_output_release(c, object);
         x12_objects_free(&c->objects, object);
         return 0;
     }

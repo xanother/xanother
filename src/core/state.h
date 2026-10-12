@@ -79,10 +79,12 @@ struct x12_retire {
     uint8_t n_cbs;
     // presentation feedback: the token names this commit and shown_ns
     // is the moment the display picked the frame up. the output present
-    // event carries both when the frame leaves
+    // event carries both when the frame leaves, one per output whose
+    // screen showed the pixels
     uint64_t token;
     uint64_t shown_ns;
     int shown;
+    uint32_t shown_outs;
     // a stolen frame went to the screen through direct scanout: its
     // release credit waits with the scanout session for the replacing
     // flip, the retire itself only carries the frame callbacks
@@ -113,10 +115,12 @@ struct x12_surface_state {
     uint32_t current_cbs[X12_MAX_CBS];
     uint8_t n_current_cbs;
     // the commit token and the moment this frame reached the screen,
-    // both ride the present feedback when the frame leaves
+    // both ride the present feedback when the frame leaves. shown_outs
+    // remembers which screens showed the pixels
     uint64_t token;
     uint64_t shown_ns;
     int shown;
+    uint32_t shown_outs;
     // the current frame went to the screen through direct scanout and
     // its release credit belongs to the scanout session
     int scanned_out;

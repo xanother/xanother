@@ -51,8 +51,8 @@ void x12_frame_credit(struct x12_conn *c, uint32_t buffer_id);
 // the compositor stamps the frame it just pushed to the host with the
 // moment the display took it, the retire later reports it as the
 // scanout time in the output present feedback
-void x12_frame_presented(struct x12_conn *c, uint32_t surface_id,
-                         uint64_t ns);
+void x12_frame_presented(struct x12_conn *c, uint32_t surface_id, uint64_t ns,
+                         uint32_t outs);
 
 // surface death: outstanding releases go out now, fences close, frame
 // callbacks die silently since no frame will complete

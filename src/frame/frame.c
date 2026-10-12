@@ -115,8 +115,10 @@ static int retire_current(struct x12_conn *c, struct x12_surface_state *s) {
     e->token = s->token;
     e->shown_ns = s->shown_ns;
     e->shown = s->shown;
+    e->shown_outs = s->shown_outs;
     e->stolen = s->scanned_out;
     s->shown = 0;
+    s->shown_outs = 0;
     s->scanned_out = 0;
     return 0;
 }
@@ -217,11 +219,16 @@ void x12_frame_drain(struct x12_conn *c, struct x12_surface_state *s) {
             emit_release(c, e->buffer_id);
         }
         retire_free_cbs(c, e, 0);
-        // the output hears about every frame that reached the screen,
+        // the outputs hear about every frame that reached their screen,
         // the token names its commit and the time is the scanout moment
         if (e->shown) {
-            x12_output_present(e->token, X12_OUTPUT_PRESENT_KIND_COPY,
-                               e->shown_ns);
+            for (int out = 0; out < X12_OUTPUT_SLOTS; out++) {
+                if (e->shown_outs & (1u << out)) {
+                    x12_output_present(out, e->token,
+                                       X12_OUTPUT_PRESENT_KIND_COPY,
+                                       e->shown_ns);
+                }
+            }
         }
         if (e->fence >= 0) {
             close(e->fence);
@@ -258,16 +265,18 @@ static void drain_force(struct x12_conn *c, struct x12_surface_state *s,
     s->n_retire = 0;
 }
 
-void x12_frame_presented(struct x12_conn *c, uint32_t surface_id,
-                         uint64_t ns) {
+void x12_frame_presented(struct x12_conn *c, uint32_t surface_id, uint64_t ns,
+                         uint32_t outs) {
     struct x12_object *o = x12_objects_get(&c->objects, surface_id);
     if (!o || o->kind != OBJ_SURFACE) {
         return;
     }
     // the compositor paints and pushes this frame to the host right
-    // now, the retire later reports the moment as the scanout time
+    // now, the retire later reports the moment as the scanout time. the
+    // mask names the outputs whose screens carried the pixels
     o->as.surface.shown = 1;
     o->as.surface.shown_ns = ns;
+    o->as.surface.shown_outs |= outs;
 }
 
 void x12_frame_destroy(struct x12_conn *c, struct x12_surface_state *s) {

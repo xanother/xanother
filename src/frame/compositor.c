@@ -199,7 +199,8 @@ void x12_comp_scanout_pump(void) {
         struct scanout_wait *w = &so_wait[ev.cookie];
         if (ev.kind == X12_SCANOUT_LANDED) {
             w->landed = 1;
-            x12_output_present(w->token, X12_OUTPUT_PRESENT_KIND_FLIP, ev.ts);
+            x12_output_present(ev.out, w->token, X12_OUTPUT_PRESENT_KIND_FLIP,
+                               ev.ts);
         } else if (ev.kind == X12_SCANOUT_REPLACED) {
             x12_frame_credit(w->c, w->buffer_id);
             w->used = 0;
@@ -215,6 +216,44 @@ void x12_comp_scanout_drop(struct x12_conn *c) {
             so_wait[i].used = 0;
         }
     }
+}
+
+// one bit per output whose screen showed pixels of this window in this
+// pass: the window must overlap the output rect and the paint must
+// reach both. an output that flipped without this window keeps its bit
+// clear, its present never names frames it did not show
+static uint32_t shown_mask(const struct x12_winview *v,
+                           const struct x12_rect *rects, int n_rects) {
+    uint32_t mask = 0;
+    for (int oi = 0; oi < X12_OUTPUT_SLOTS; oi++) {
+        struct x12_out_info o;
+        if (!x12_backend->output_info(oi, &o)) {
+            continue;
+        }
+        int64_t x0 = v->x > o.x ? v->x : o.x;
+        int64_t y0 = v->y > o.y ? v->y : o.y;
+        int64_t x1 = v->x + (int64_t)v->width;
+        int64_t y1 = v->y + (int64_t)v->height;
+        if (x1 > o.x + (int64_t)o.width) {
+            x1 = o.x + (int64_t)o.width;
+        }
+        if (y1 > o.y + (int64_t)o.height) {
+            y1 = o.y + (int64_t)o.height;
+        }
+        if (x1 <= x0 || y1 <= y0) {
+            continue;
+        }
+        for (int k = 0; k < n_rects; k++) {
+            int64_t rx1 = rects[k].x + (int64_t)rects[k].w;
+            int64_t ry1 = rects[k].y + (int64_t)rects[k].h;
+            if (rx1 > x0 && rects[k].x < x1 && ry1 > y0 &&
+                rects[k].y < y1) {
+                mask |= 1u << oi;
+                break;
+            }
+        }
+    }
+    return mask;
 }
 
 int x12_comp_pass(struct x12_conn *conns, size_t n) {
@@ -403,13 +442,16 @@ int x12_comp_pass(struct x12_conn *conns, size_t n) {
     sprite_drawn = have_sprite;
 
     x12_backend->present(fb, rects, n_rects);
-    // every surface the stack showed takes the moment the display picks
-    // the frame up, the retire later reports it as the scanout time. a
-    // surface that never reached the pass never gets a present at all
+    // every surface the pass showed takes the moment the display picks
+    // the frame up, one bit per output whose screen carried its pixels.
+    // a surface the paint never touched stays silent, no present lies
     uint64_t shown = x12_now_ns();
     for (int i = 0; i < nw; i++) {
         const struct x12_winview *v = x12_windows_at(i);
-        x12_frame_presented(v->client, v->surface_id, shown);
+        uint32_t outs = shown_mask(v, rects, n_rects);
+        if (outs) {
+            x12_frame_presented(v->client, v->surface_id, shown, outs);
+        }
     }
     return 1;
 }

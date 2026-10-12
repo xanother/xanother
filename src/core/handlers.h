@@ -11,6 +11,9 @@
 
 int x12_handle_connection(struct x12_conn *c, uint32_t object,
                           const x12_msg_desc *msg, const x12_arg *args);
+// one registry.global for one output instance, hotplug announces late
+// arrivals to connections that are already up
+int x12_announce_output(struct x12_conn *c, uint32_t instance);
 int x12_handle_output(struct x12_conn *c, uint32_t object,
                       const x12_msg_desc *msg, const x12_arg *args);
 
