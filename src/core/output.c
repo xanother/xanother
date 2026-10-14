@@ -69,6 +69,15 @@ void x12_output_bind(struct x12_conn *c, uint32_t id, int slot) {
     // instead of a kill
 }
 
+int x12_output_slot_of(struct x12_conn *c, uint32_t id) {
+    for (size_t i = 0; i < X12_MAX_CLIENTS; i++) {
+        if (bindings[i].c == c && bindings[i].id == id) {
+            return bindings[i].slot;
+        }
+    }
+    return -1;
+}
+
 void x12_output_release(struct x12_conn *c, uint32_t id) {
     for (size_t i = 0; i < X12_MAX_CLIENTS; i++) {
         if (bindings[i].c == c && bindings[i].id == id) {

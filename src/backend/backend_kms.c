@@ -633,19 +633,146 @@ static int kms_output_info(int out, struct x12_out_info *info) {
     return 1;
 }
 
+// object properties by name, the type tag keeps the lookup on the
+// right drm object class
+static int prop_get(uint32_t obj_type, uint32_t obj, const char *name,
+                    uint64_t *val) {
+    drmModeObjectPropertiesPtr p =
+        drmModeObjectGetProperties(card_fd, obj, obj_type);
+    if (!p) {
+        return -1;
+    }
+    int rc = -1;
+    for (uint32_t i = 0; i < p->count_props; i++) {
+        drmModePropertyPtr pr = drmModeGetProperty(card_fd, p->props[i]);
+        if (pr && strcmp(pr->name, name) == 0) {
+            *val = p->prop_values[i];
+            rc = 0;
+        }
+        if (pr) {
+            drmModeFreeProperty(pr);
+        }
+        if (rc == 0) {
+            break;
+        }
+    }
+    drmModeFreeObjectProperties(p);
+    return rc;
+}
+
+static int prop_set(uint32_t obj_type, uint32_t obj, const char *name,
+                    uint64_t val) {
+    drmModeObjectPropertiesPtr p =
+        drmModeObjectGetProperties(card_fd, obj, obj_type);
+    if (!p) {
+        return -1;
+    }
+    int rc = -1;
+    for (uint32_t i = 0; i < p->count_props; i++) {
+        drmModePropertyPtr pr = drmModeGetProperty(card_fd, p->props[i]);
+        if (pr && strcmp(pr->name, name) == 0) {
+            rc = drmModeObjectSetProperty(card_fd, obj, pr->prop_id, val,
+                                          pr->flags);
+            drmModeFreeProperty(pr);
+            break;
+        }
+        if (pr) {
+            drmModeFreeProperty(pr);
+        }
+    }
+    drmModeFreeObjectProperties(p);
+    return rc;
+}
+
+// the panel advertises its refresh window in the edid range limits
+// descriptor, the mode list only bounds the fixed rates it happens to
+// expose. returns 0 when the descriptor is absent
+static int edid_vrr_range(uint32_t conn_id, int *min_millihz,
+                          int *max_millihz) {
+    uint64_t blob_id = 0;
+    if (prop_get(DRM_MODE_OBJECT_CONNECTOR, conn_id, "EDID", &blob_id) != 0 ||
+        !blob_id) {
+        return 0;
+    }
+    drmModePropertyBlobPtr b = drmModeGetPropertyBlob(card_fd, blob_id);
+    if (!b) {
+        return 0;
+    }
+    int rc = 0;
+    const uint8_t *e = b->data;
+    // monitor descriptors start at byte 54 of every 128 byte block
+    for (size_t blk = 1; blk * 128 < b->length && !rc; blk++) {
+        const uint8_t *d = e + blk * 128 + 54;
+        for (int k = 0; k < 4; k++, d += 18) {
+            if (d[0] == 0 && d[1] == 0 && d[2] == 0 && d[3] == 0xFD &&
+                d[5] > 0 && d[6] >= d[5]) {
+                *min_millihz = d[5] * 1000;
+                *max_millihz = d[6] * 1000;
+                rc = 1;
+            }
+        }
+    }
+    drmModeFreePropertyBlob(b);
+    return rc;
+}
+
 static int kms_output_vrr(int out, uint32_t *min_millihz,
                           uint32_t *max_millihz) {
-    (void)out;
-    (void)min_millihz;
-    (void)max_millihz;
-    // vrr capability lands with the hardware parties
-    return 0;
+    if (out < 0 || out >= n_out_slots || !outs[out].live) {
+        return 0;
+    }
+    uint64_t capable = 0;
+    if (prop_get(DRM_MODE_OBJECT_CONNECTOR, outs[out].conn_id, "vrr_capable",
+                 &capable) != 0 ||
+        !capable) {
+        return 0;
+    }
+    int mn = 0, mx = 0;
+    if (edid_vrr_range(outs[out].conn_id, &mn, &mx) && mn > 0) {
+        *min_millihz = (uint32_t)mn;
+        *max_millihz = (uint32_t)mx;
+        return 1;
+    }
+    // no range descriptor: the mode list bounds the window instead
+    mn = -1;
+    mx = 0;
+    drmModeConnector *conn =
+        drmModeGetConnector(card_fd, outs[out].conn_id);
+    if (conn) {
+        for (int i = 0; i < conn->count_modes; i++) {
+            int hz = mode_millihz(&conn->modes[i]);
+            if (hz > 0 && (mn < 0 || hz < mn)) {
+                mn = hz;
+            }
+            if (hz > mx) {
+                mx = hz;
+            }
+        }
+        drmModeFreeConnector(conn);
+    }
+    if (mn < 0) {
+        return 0;
+    }
+    *min_millihz = (uint32_t)mn;
+    *max_millihz = (uint32_t)mx;
+    return 1;
 }
 
 static int kms_set_vrr(int out, int enable) {
-    (void)out;
-    (void)enable;
-    return -1;
+    if (out < 0 || out >= n_out_slots || !outs[out].live) {
+        return -1;
+    }
+    uint64_t capable = 0;
+    if (prop_get(DRM_MODE_OBJECT_CONNECTOR, outs[out].conn_id, "vrr_capable",
+                 &capable) != 0 ||
+        !capable) {
+        return -1;
+    }
+    if (prop_set(DRM_MODE_OBJECT_CRTC, outs[out].crtc_id, "VRR_ENABLED",
+                 enable ? 1 : 0) != 0) {
+        return -1;
+    }
+    return 0;
 }
 
 static int kms_output_poll(struct x12_output_event *ev) {

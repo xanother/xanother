@@ -3,6 +3,7 @@
 
 #include "handlers.h"
 
+#include "backend.h"
 #include "output.h"
 
 #include <string.h>
@@ -257,15 +258,29 @@ static int handle_bind(struct x12_conn *c, uint32_t object, const x12_arg *args)
 
 int x12_handle_output(struct x12_conn *c, uint32_t object,
                       const x12_msg_desc *msg, const x12_arg *args) {
-    (void)args;
     if (strcmp(msg->name, "release") == 0) {
         x12_output_release(c, object);
         x12_objects_free(&c->objects, object);
         return 0;
     }
     if (strcmp(msg->name, "set_vrr") == 0) {
-        // vrr rides with the hardware parties, anything else is a lie
-        x12_conn_error(c, X12_ERROR_CODE_IMPLEMENTATION, object);
+        // anything above 1 is refused with bad-value, hosts without vrr
+        // support refuse the same way
+        uint32_t enable = (uint32_t)args[0].u64;
+        if (enable > 1) {
+            x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
+            return 0;
+        }
+        int slot = x12_output_slot_of(c, object);
+        uint32_t min_millihz = 0, max_millihz = 0;
+        if (slot < 0 || !x12_backend->output_vrr ||
+            !x12_backend->output_vrr(slot, &min_millihz, &max_millihz) ||
+            !x12_backend->set_vrr ||
+            x12_backend->set_vrr(slot, (int)enable) != 0) {
+            x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
+            return 0;
+        }
+        x12_output_vrr(slot, enable, min_millihz, max_millihz);
         return 0;
     }
     x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);

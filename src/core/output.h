@@ -46,6 +46,10 @@ void x12_output_unbind(struct x12_conn *c);
 // output whose bindings hear it
 void x12_output_present(int slot, uint64_t token, uint32_t kind, uint64_t ns);
 
+// which screen slot a bound output object names, -1 when the object
+// holds no output binding
+int x12_output_slot_of(struct x12_conn *c, uint32_t id);
+
 // hotplug and vrr state changes for the bindings of one output
 void x12_output_removed(int slot);
 void x12_output_vrr(int slot, uint32_t enabled, uint32_t min_millihz,
