@@ -96,6 +96,51 @@ void x12_output_unbind(struct x12_conn *c) {
     }
 }
 
+int x12_output_send_desc(struct x12_conn *c, uint32_t id, int slot) {
+    struct x12_output_desc d;
+    if (!x12_output_describe(slot, &d)) {
+        return 0;
+    }
+    const x12_iface_desc *oi = x12_iface_find("x12_output");
+    // the one mode the screen runs is both current and preferred, the
+    // enum can only say one thing so it names the truth a user picking
+    // a mode cares about
+    x12_arg m[4] = {
+        { .u64 = d.w },
+        { .u64 = d.h },
+        { .u64 = d.refresh_millihz },
+        { .u64 = X12_OUTPUT_MODE_FLAG_PREFERRED },
+    };
+    if (x12_conn_event(c, oi, "mode", id, m, 4) != 0) {
+        return -1;
+    }
+    x12_arg g[4] = {
+        { .i64 = d.x },
+        { .i64 = d.y },
+        { .u64 = d.mm_w },
+        { .u64 = d.mm_h },
+    };
+    if (x12_conn_event(c, oi, "geometry", id, g, 4) != 0) {
+        return -1;
+    }
+    x12_arg sc[1] = { { .i64 = 256 } };
+    if (x12_conn_event(c, oi, "scale", id, sc, 1) != 0) {
+        return -1;
+    }
+    x12_arg nm[1] = {
+        { .str = d.name, .str_len = (uint32_t)strlen(d.name) },
+    };
+    return x12_conn_event(c, oi, "name", id, nm, 1);
+}
+
+void x12_output_refresh(int slot) {
+    for (size_t i = 0; i < X12_MAX_CLIENTS; i++) {
+        if (bindings[i].c && bindings[i].slot == slot) {
+            x12_output_send_desc(bindings[i].c, bindings[i].id, slot);
+        }
+    }
+}
+
 // one event to every binding of one output
 static void fan_out(int slot, const char *event, const x12_arg *a, int n_args,
                     uint64_t ns) {

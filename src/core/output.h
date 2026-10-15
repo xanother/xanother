@@ -50,6 +50,12 @@ void x12_output_present(int slot, uint64_t token, uint32_t kind, uint64_t ns);
 // holds no output binding
 int x12_output_slot_of(struct x12_conn *c, uint32_t id);
 
+// the description burst (mode, geometry, scale, name) for one binding
+// or for every binding of one output, binds and hotplug returns ride
+// it. returns -1 when the connection refused the events
+int x12_output_send_desc(struct x12_conn *c, uint32_t id, int slot);
+void x12_output_refresh(int slot);
+
 // hotplug and vrr state changes for the bindings of one output
 void x12_output_removed(int slot);
 void x12_output_vrr(int slot, uint32_t enabled, uint32_t min_millihz,

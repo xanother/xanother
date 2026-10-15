@@ -16,6 +16,9 @@
 #include <unistd.h>
 
 #include <poll.h>
+#include <time.h>
+
+#include <libudev.h>
 
 #include <drm_fourcc.h>
 #include <sys/ioctl.h>
@@ -82,6 +85,27 @@ static struct so_fb so[2];
 static struct so_fb *so_front[X12_OUT_MAX];
 static struct x12_scanout_event so_evq[8];
 static int so_evq_n;
+
+// hotplug: udev watches the drm subsystem, the kernel fd carries no in
+// band message when a cable moves
+static struct udev *udev_ctx;
+static struct udev_monitor *udev_mon;
+static struct x12_output_event out_evq[8];
+static int out_evq_n;
+
+static void push_out_event(int kind, int out) {
+    if (out_evq_n < (int)(sizeof out_evq / sizeof out_evq[0])) {
+        out_evq[out_evq_n].kind = kind;
+        out_evq[out_evq_n].out = out;
+        out_evq_n++;
+    }
+}
+
+static uint64_t now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
 
 static void push_event(int kind, uint32_t cookie, uint64_t ts, int out) {
     if (so_evq_n < (int)(sizeof so_evq / sizeof so_evq[0])) {
@@ -236,6 +260,74 @@ static uint32_t pick_crtc(drmModeRes *res, const drmModeConnector *conn) {
         }
     }
     return 0;
+}
+
+// a head that goes down keeps its slot and its place on the canvas,
+// only the chain and the scanout state die with the connector
+static void out_take_down(struct output *o) {
+    int oi = (int)(o - outs);
+    uint64_t ts = now_ns();
+    // scanout buffers riding this head never land now, their sessions
+    // get the replacement credit instead of a lost buffer
+    for (int i = 0; i < 2; i++) {
+        if (so[i].in_use && so[i].out == oi) {
+            push_event(X12_SCANOUT_REPLACED, so[i].cookie, ts, oi);
+            so_free(&so[i]);
+            if (so_front[oi] == &so[i]) {
+                so_front[oi] = 0;
+            }
+        }
+    }
+    drmModeSetCrtc(card_fd, o->crtc_id, 0, 0, 0, NULL, 0, NULL);
+    for (int k = 0; k < 2; k++) {
+        dumb_free(card_fd, &o->slot[k]);
+    }
+    o->front = 0;
+    o->pending = -1;
+    o->live = 0;
+    fprintf(stderr, "kms backend: output %d (%s) down\n", oi, o->name);
+    push_out_event(X12_OUTPUT_REMOVED, oi);
+}
+
+// a returning connector gets a fresh pair of dumb buffers on its own
+// mode, the tiling slot and the instance stay where they were
+static int out_rearm(int oi) {
+    struct output *o = &outs[oi];
+    drmModeConnector *conn = drmModeGetConnector(card_fd, o->conn_id);
+    if (!conn || conn->connection != DRM_MODE_CONNECTED ||
+        conn->count_modes == 0) {
+        if (conn) {
+            drmModeFreeConnector(conn);
+        }
+        return 0;
+    }
+    o->mode = conn->modes[0];
+    drmModeFreeConnector(conn);
+    uint32_t w = o->mode.hdisplay, h = o->mode.vdisplay;
+    for (int i = 0; i < 2; i++) {
+        if (dumb_alloc(card_fd, &o->slot[i], w, h) != 0) {
+            for (int k = 0; k < i; k++) {
+                dumb_free(card_fd, &o->slot[k]);
+            }
+            return 0;
+        }
+        fill_black(&o->slot[i], w, h);
+    }
+    if (drmModeSetCrtc(card_fd, o->crtc_id, o->slot[0].fb_id, 0, 0,
+                       &o->conn_id, 1, &o->mode) != 0) {
+        fprintf(stderr, "kms backend: re-arm refused on %s: %s\n", o->name,
+                strerror(errno));
+        for (int k = 0; k < 2; k++) {
+            dumb_free(card_fd, &o->slot[k]);
+        }
+        return 0;
+    }
+    o->front = 0;
+    o->pending = -1;
+    o->live = 1;
+    fprintf(stderr, "kms backend: output %d (%s) back\n", oi, o->name);
+    push_out_event(X12_OUTPUT_ADDED, oi);
+    return 1;
 }
 
 // claims a free slot for one connected connector and arms its chain.
@@ -480,6 +572,31 @@ static int kms_init(int argc, char **argv) {
     evctx.version = DRM_EVENT_CONTEXT_VERSION;
     evctx.page_flip_handler = flip_handler;
 
+    // hotplug arrives as a udev change on the drm subsystem, without
+    // the monitor the pump falls back to polling every connector
+    udev_ctx = udev_new();
+    if (udev_ctx) {
+        udev_mon = udev_monitor_new_from_netlink(udev_ctx, "udev");
+        if (udev_mon) {
+            udev_monitor_filter_add_match_subsystem_devtype(udev_mon, "drm",
+                                                            NULL);
+            if (udev_monitor_enable_receiving(udev_mon) == 0) {
+                int mfd = udev_monitor_get_fd(udev_mon);
+                int fl = fcntl(mfd, F_GETFL, 0);
+                if (fl >= 0) {
+                    fcntl(mfd, F_SETFL, fl | O_NONBLOCK);
+                }
+                printf("kms backend: hotplug monitor armed on udev\n");
+            } else {
+                udev_monitor_unref(udev_mon);
+                udev_mon = NULL;
+            }
+        }
+        if (!udev_mon) {
+            udev_unref(udev_ctx);
+            udev_ctx = NULL;
+        }
+    }
     return 0;
 
 fail:
@@ -499,6 +616,14 @@ fail:
 }
 
 static void kms_destroy(void) {
+    if (udev_mon) {
+        udev_monitor_unref(udev_mon);
+        udev_mon = NULL;
+    }
+    if (udev_ctx) {
+        udev_unref(udev_ctx);
+        udev_ctx = NULL;
+    }
     if (card_fd < 0) {
         return;
     }
@@ -775,15 +900,102 @@ static int kms_set_vrr(int out, int enable) {
     return 0;
 }
 
+// any drm change rechecks the connectors: cables that left take their
+// head down and the session keeps running on the rest, new cables take
+// free slots and never steal the identity of a down head
+static void recheck_connectors(void) {
+    for (int i = 0; i < n_out_slots; i++) {
+        struct output *o = &outs[i];
+        if (!o->conn_id) {
+            continue;
+        }
+        drmModeConnector *conn = drmModeGetConnector(card_fd, o->conn_id);
+        int connected = conn && conn->connection == DRM_MODE_CONNECTED &&
+                        conn->count_modes > 0;
+        if (conn) {
+            drmModeFreeConnector(conn);
+        }
+        if (o->live && !connected) {
+            out_take_down(o);
+        } else if (!o->live && connected) {
+            out_rearm(i);
+        }
+    }
+    // connectors nobody ever saw take the next free slot
+    drmModeRes *res = drmModeGetResources(card_fd);
+    if (!res) {
+        return;
+    }
+    for (int i = 0; i < res->count_connectors && n_out_slots < X12_OUT_MAX;
+         i++) {
+        int owned = 0;
+        for (int k = 0; k < n_out_slots; k++) {
+            if (outs[k].conn_id == res->connectors[i]) {
+                owned = 1;
+                break;
+            }
+        }
+        if (owned) {
+            continue;
+        }
+        drmModeConnector *conn =
+            drmModeGetConnector(card_fd, res->connectors[i]);
+        int connected = conn && conn->connection == DRM_MODE_CONNECTED &&
+                        conn->count_modes > 0 &&
+                        conn->connector_type != DRM_MODE_CONNECTOR_WRITEBACK;
+        if (conn) {
+            drmModeFreeConnector(conn);
+        }
+        if (!connected) {
+            continue;
+        }
+        int idx = output_bring_up(res, res->connectors[i]);
+        if (idx >= 0) {
+            fprintf(stderr, "kms backend: output %d (%s) appeared\n", idx,
+                    outs[idx].name);
+            push_out_event(X12_OUTPUT_ADDED, idx);
+        }
+    }
+    drmModeFreeResources(res);
+}
+
+static void drain_udev(void) {
+    if (!udev_mon) {
+        // no monitor, the connectors are polled every so often instead
+        static int counter;
+        if (++counter % 50 == 0) {
+            recheck_connectors();
+        }
+        return;
+    }
+    int changed = 0;
+    struct udev_device *dev;
+    while ((dev = udev_monitor_receive_device(udev_mon)) != NULL) {
+        changed = 1;
+        udev_device_unref(dev);
+    }
+    if (changed) {
+        recheck_connectors();
+    }
+}
+
 static int kms_output_poll(struct x12_output_event *ev) {
-    (void)ev;
-    // hotplug lands with the hardware parties
-    return 0;
+    if (out_evq_n == 0) {
+        return 0;
+    }
+    *ev = out_evq[0];
+    for (int i = 1; i < out_evq_n; i++) {
+        out_evq[i - 1] = out_evq[i];
+    }
+    out_evq_n--;
+    return 1;
 }
 
 static void kms_pump(void) {
-    // flip completions land here every loop turn and free the chains
+    // flip completions land here every loop turn and free the chains,
+    // cable moves arrive on the udev monitor next to them
     drain_flip_events();
+    drain_udev();
 }
 
 static int kms_halt_requested(void) {

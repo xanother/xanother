@@ -33,7 +33,7 @@ gcc $CFLAGS $DRM_CFLAGS -o build/x12-server \
     src/backend/backend_headless.c src/backend/backend_kms.c \
     src/wire/x12_wire.c \
     build/gen/x12_tables.c \
-    -lxkbcommon -ldl -ldrm
+    -lxkbcommon -ldl -ldrm -ludev
 
 gcc $CFLAGS -o build/c_roundtrip \
     tests/c_roundtrip.c \

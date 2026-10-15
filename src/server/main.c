@@ -16,6 +16,7 @@
 
 #include "conn.h"
 #include "dispatch.h"
+#include "handlers.h"
 #include "limits.h"
 #include "output.h"
 #include "buffer.h"
@@ -75,6 +76,57 @@ static int make_socket(const char *path) {
         return -1;
     }
     return s;
+}
+
+// cables move while the server runs: outputs announce themselves, dead
+// heads say so and the canvas follows the bounding box of the live ones
+static void sync_outputs(struct x12_conn *conns, size_t n) {
+    struct x12_output_event ev;
+    int changed = 0;
+    while (x12_backend->output_poll && x12_backend->output_poll(&ev)) {
+        changed = 1;
+        if (ev.kind == X12_OUTPUT_REMOVED) {
+            x12_output_drop(ev.out);
+            x12_output_removed(ev.out);
+            continue;
+        }
+        struct x12_out_info oi;
+        struct x12_output_desc d;
+        if (x12_backend->output_info(ev.out, &oi)) {
+            memset(&d, 0, sizeof d);
+            snprintf(d.name, sizeof d.name, "%s",
+                     oi.name ? oi.name : "X12");
+            d.x = oi.x;
+            d.y = oi.y;
+            d.w = oi.width;
+            d.h = oi.height;
+            d.mm_w = oi.mm_width;
+            d.mm_h = oi.mm_height;
+            d.refresh_millihz = oi.refresh_millihz;
+            x12_output_set(ev.out, &d);
+        }
+        // the bindings that survived hear the screen is back and every
+        // connection up now learns the instance for fresh binds
+        x12_output_refresh(ev.out);
+        for (size_t i = 0; i < n; i++) {
+            if (conns[i].fd >= 0 && !conns[i].dead) {
+                x12_announce_output(&conns[i], (uint32_t)ev.out);
+            }
+        }
+    }
+    if (!changed) {
+        return;
+    }
+    uint32_t w = 0, h = 0;
+    x12_backend->get_size(&w, &h);
+    if (w == 0 || h == 0) {
+        // every head is down, the canvas keeps its last size until one
+        // of them comes home
+        return;
+    }
+    x12_comp_set_size(w, h);
+    x12_windows_set_output(w, h);
+    x12_comp_full_damage();
 }
 
 int main(int argc, char **argv) {
@@ -287,6 +339,9 @@ int main(int argc, char **argv) {
         // flip landings become present feedback, replacements become
         // release credits for the buffers that waited on screen
         x12_comp_scanout_pump();
+        // cables move: outputs announce themselves, dead heads say so
+        // and the canvas follows the bounding box of the live ones
+        sync_outputs(conns, X12_MAX_CLIENTS);
     }
 
     for (size_t i = 0; i < X12_MAX_CLIENTS; i++) {
