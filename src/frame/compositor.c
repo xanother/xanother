@@ -127,11 +127,22 @@ static int try_scanout(struct x12_conn *c, struct x12_surface_state *s,
         return 0;
     }
     const struct x12_winview *v = x12_windows_at(0);
-    if (v->x != 0 || v->y != 0 || v->width != fb_w || v->height != fb_h) {
+    // the window must cover exactly one live output 1:1, the flip goes
+    // to that head
+    int out = -1;
+    struct x12_out_info oi;
+    for (int i = 0; i < X12_OUTPUT_SLOTS; i++) {
+        if (x12_backend->output_info(i, &oi) && v->x == oi.x &&
+            v->y == oi.y && v->width == oi.width && v->height == oi.height) {
+            out = i;
+            break;
+        }
+    }
+    if (out < 0) {
         return 0;
     }
     if (!s->has_current || s->current.dmabuf_fd < 0 ||
-        s->current.width != fb_w || s->current.height != fb_h ||
+        s->current.width != oi.width || s->current.height != oi.height ||
         s->current.format != X12_FORMAT_XRGB8888) {
         return 0;
     }
@@ -163,6 +174,7 @@ static int try_scanout(struct x12_conn *c, struct x12_surface_state *s,
         .format = s->current.format,
         .stride = s->current.stride,
         .modifier = s->current.modifier,
+        .out = out,
         .cookie = (uint32_t)slot,
     };
     if (!x12_backend->scanout(&req)) {

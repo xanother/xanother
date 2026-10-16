@@ -52,7 +52,8 @@ void x12_windows_update(int idx, int32_t x, int32_t y, uint32_t w,
 // placement policies: diagonal cascade for toplevels, origin pin for
 // fullscreen, anchor rect math for popups. all clamp into the output
 void x12_windows_place_toplevel(int32_t *x, int32_t *y);
-void x12_windows_place_fullscreen(int idx, int on);
+void x12_windows_place_fullscreen(int idx, int on, int32_t ox,
+                                 int32_t oy);
 void x12_windows_place_popup(int32_t rect_x, int32_t rect_y,
                              uint32_t rect_w, uint32_t rect_h,
                              uint32_t anchor, uint32_t gravity,

@@ -190,18 +190,18 @@ void x12_windows_place_toplevel(int32_t *x, int32_t *y) {
     *y = py;
 }
 
-void x12_windows_place_fullscreen(int idx, int on) {
+void x12_windows_place_fullscreen(int idx, int on, int32_t ox, int32_t oy) {
     if (idx < 0 || idx >= n_views || views[idx].is_popup) {
         return;
     }
-    // fullscreen pins the view to the output origin so the surface
+    // fullscreen pins the view to its output origin so the surface
     // covers the mode exactly; leaving returns to the cascade spot the
     // placement policy hands out today. a commit re-pins a fullscreen
     // view every frame, an unchanged pin must not dirty the stack
     int32_t nx = views[idx].x, ny = views[idx].y;
     if (on) {
-        nx = 0;
-        ny = 0;
+        nx = ox;
+        ny = oy;
     } else {
         x12_windows_place_toplevel(&nx, &ny);
     }

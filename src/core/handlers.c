@@ -576,6 +576,48 @@ static void surface_logical(const struct x12_surface_state *s, uint32_t *w,
     *h = (s->current.height * 256u + sc / 2) / sc;
 }
 
+// the screen a fullscreen window takes: a fresh map lands on the
+// output whose mode matches the surface size, a mapped view stays on
+// the output it already covers. the client never positions windows,
+// the server is the only one who knows where they are. returns 0 when
+// no output lives at all
+static int pick_output(int32_t x, int32_t y, uint32_t w, uint32_t h,
+                       int prefer_size, struct x12_out_info *out) {
+    int best = -1;
+    int64_t best_overlap = 0;
+    for (int i = 0; i < X12_OUTPUT_SLOTS; i++) {
+        struct x12_out_info oi;
+        if (!x12_backend->output_info(i, &oi)) {
+            continue;
+        }
+        if (best < 0) {
+            best = i;
+            *out = oi;
+        }
+        if (prefer_size && oi.width == w && oi.height == h) {
+            *out = oi;
+            return 1;
+        }
+        int64_t x0 = x > oi.x ? x : oi.x;
+        int64_t y0 = y > oi.y ? y : oi.y;
+        int64_t x1 = x + (int64_t)w;
+        int64_t y1 = y + (int64_t)h;
+        if (x1 > oi.x + (int64_t)oi.width) {
+            x1 = oi.x + (int64_t)oi.width;
+        }
+        if (y1 > oi.y + (int64_t)oi.height) {
+            y1 = oi.y + (int64_t)oi.height;
+        }
+        int64_t ov = x1 > x0 && y1 > y0 ? (x1 - x0) * (y1 - y0) : 0;
+        if (ov > best_overlap) {
+            best_overlap = ov;
+            best = i;
+            *out = oi;
+        }
+    }
+    return best >= 0;
+}
+
 // sends a configure for a window role, the serial ties the offer to the
 // client ack_configure. the toplevel event carries a states array, the
 // popup event does not
@@ -651,11 +693,17 @@ static void apply_role_after_commit(struct x12_conn *c, uint32_t surface_id,
         if (t->acked_config == t->last_config) {
             if (view < 0) {
                 int32_t x, y;
-                // a fullscreen map skips the cascade, the view pins the
-                // output origin
+                // a fullscreen map skips the cascade, the view pins
+                // its output origin
                 if (t->fullscreen) {
-                    x = 0;
-                    y = 0;
+                    struct x12_out_info oi;
+                    if (pick_output(0, 0, lw, lh, 1, &oi)) {
+                        x = oi.x;
+                        y = oi.y;
+                    } else {
+                        x = 0;
+                        y = 0;
+                    }
                 } else {
                     x12_windows_place_toplevel(&x, &y);
                 }
@@ -666,7 +714,12 @@ static void apply_role_after_commit(struct x12_conn *c, uint32_t surface_id,
                 // the pin survives every accepted geometry, a plain
                 // commit must not park a fullscreen view back anywhere
                 if (t->fullscreen) {
-                    x12_windows_place_fullscreen(view, 1);
+                    const struct x12_winview *pv = x12_windows_at(view);
+                    struct x12_out_info oi;
+                    if (pick_output(pv->x, pv->y, pv->width, pv->height, 0,
+                                    &oi)) {
+                        x12_windows_place_fullscreen(view, 1, oi.x, oi.y);
+                    }
                 }
             }
         } else {
@@ -675,7 +728,13 @@ static void apply_role_after_commit(struct x12_conn *c, uint32_t surface_id,
             // reoffered the whole mode, not the stale committed size
             uint32_t ow = lw, oh = lh;
             if (t->fullscreen) {
-                x12_windows_output(&ow, &oh);
+                struct x12_out_info oi;
+                if (pick_output(0, 0, lw, lh, 1, &oi)) {
+                    ow = oi.width;
+                    oh = oi.height;
+                } else {
+                    x12_windows_output(&ow, &oh);
+                }
             }
             send_role_configure(c, s->role_id, 0, ow, oh, t->fullscreen,
                                 &t->last_config);
@@ -797,16 +856,23 @@ int x12_handle_toplevel(struct x12_conn *c, uint32_t object,
             // a mapped view is offered the size it must take: the whole
             // mode entering fullscreen, the natural size leaving it
             const struct x12_winview *v = x12_windows_at(view);
-            if (state) {
+            struct x12_out_info oi;
+            if (state && pick_output(v->x, v->y, v->width, v->height, 0,
+                                     &oi)) {
+                ow = oi.width;
+                oh = oi.height;
+                x12_windows_place_fullscreen(view, 1, oi.x, oi.y);
+            } else if (state) {
                 x12_windows_output(&ow, &oh);
+                x12_windows_place_fullscreen(view, 1, 0, 0);
             } else {
                 ow = v->nat_w;
                 oh = v->nat_h;
+                x12_windows_place_fullscreen(view, 0, 0, 0);
             }
-            x12_windows_place_fullscreen(view, (int)state);
         } else {
             // an unmapped role is offered the committed buffer size
-            // unless fullscreen demands the mode
+            // unless fullscreen demands a mode
             ow = oh = 0;
             struct x12_object *surf =
                 t->surface_id ? x12_objects_get(&c->objects, t->surface_id)
@@ -815,7 +881,13 @@ int x12_handle_toplevel(struct x12_conn *c, uint32_t object,
                 surface_logical(&surf->as.surface, &ow, &oh);
             }
             if (state) {
-                x12_windows_output(&ow, &oh);
+                struct x12_out_info oi;
+                if (pick_output(0, 0, ow, oh, 1, &oi)) {
+                    ow = oi.width;
+                    oh = oi.height;
+                } else {
+                    x12_windows_output(&ow, &oh);
+                }
             }
         }
         send_role_configure(c, object, 0, ow, oh, (int)state,
