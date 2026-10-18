@@ -1,0 +1,31 @@
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -12,6 +12,8 @@
+        description: 'Enable Xnest nested X server')
+ option('xvfb', type: 'boolean', value: true,
+        description: 'Enable Xvfb X server')
++option('x12', type: 'boolean', value: false,
++       description: 'X12 bridge DDX (sources synced by the parent repo)')
+ option('xwin', type: 'combo', choices: ['true', 'false', 'auto'], value: 'auto',
+        description: 'Enable XWin X server')
+ option('xquartz', type: 'combo', choices: ['true', 'false', 'auto'], value: 'auto',
+--- a/meson.build
++++ b/meson.build
+@@ -289,6 +289,7 @@
+ 
+ build_xephyr = get_option('xephyr')
+ build_xvfb = get_option('xvfb')
++build_x12 = get_option('x12')
+ 
+ summary({
+         'Xorg': build_xorg,
+--- a/hw/meson.build
++++ b/hw/meson.build
+@@ -25,3 +25,7 @@
+ if build_xwin
+     subdir('xwin')
+ endif
++
++if build_x12
++    subdir('x12')
++endif
