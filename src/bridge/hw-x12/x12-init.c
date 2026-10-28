@@ -648,9 +648,15 @@ x12NotifyFd(int fd, int ready, void *data)
             }
         }
     }
-    // a release event just reopened the gate: parked damage goes out
-    // right here, waiting for the block handler beat would queue whole
-    // repaints behind a busy dix main loop
+    // a release event just reopened the gate: a queued resize goes
+    // out first, parked damage would copy at the wrong geometry
+    // otherwise and the resize would wait forever behind the pump
+    if (bridge_screen && x12_bridge_gate_open()) {
+        x12_bridge_commit_queued();
+    }
+    // parked damage goes out right here too, waiting for the block
+    // handler beat would queue whole repaints behind a busy dix main
+    // loop
     if (bridge_screen && pending_ready &&
         RegionNotEmpty(&pending_damage) && x12_bridge_gate_open()) {
         x12_pump_boxes(bridge_screen, &pending_damage);
