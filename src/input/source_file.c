@@ -8,6 +8,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "backend.h"
 #include "input.h"
 
 static int file_fd = -1;
@@ -65,8 +66,12 @@ static void push_line(char *line) {
         e.axis = axis;
         e.value = a;
     } else {
-        // a malformed line is a source bug, one wrong line must not
-        // poison the rest of the stream
+        // not an input line: the backend test bench gets its shot
+        // (resize, heads, head up and down), one wrong line must not
+        // poison the rest of the stream either way
+        if (x12_backend->host_command) {
+            x12_backend->host_command(line);
+        }
         return;
     }
     x12_input_push(&e);

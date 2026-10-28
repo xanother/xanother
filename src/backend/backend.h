@@ -85,6 +85,10 @@ struct x12_backend_ops {
     int (*scanout_poll)(struct x12_scanout_event *ev);
     // pumps host events, may present again on expose
     void (*pump)(void);
+    // test bench hook: a host event line the input stand could not
+    // parse as input, backends with runtime affordances (the headless
+    // canvas and heads) consume them here; 1 = consumed
+    int (*host_command)(const char *line);
     // nonzero when the host asks the server to quit
     int (*halt_requested)(void);
     void (*shutdown)(void);
