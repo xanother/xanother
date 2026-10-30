@@ -615,7 +615,10 @@ static int pick_output(int32_t x, int32_t y, uint32_t w, uint32_t h,
             *out = oi;
         }
     }
-    return best >= 0;
+    // a size pick that found no exact match is a miss, the caller
+    // falls back to the whole canvas: the rootful surface covers every
+    // head and must not pin to one of them
+    return prefer_size ? 0 : best >= 0;
 }
 
 // sends a configure for a window role, the serial ties the offer to the
@@ -857,7 +860,7 @@ int x12_handle_toplevel(struct x12_conn *c, uint32_t object,
             // mode entering fullscreen, the natural size leaving it
             const struct x12_winview *v = x12_windows_at(view);
             struct x12_out_info oi;
-            if (state && pick_output(v->x, v->y, v->width, v->height, 0,
+            if (state && pick_output(v->x, v->y, v->width, v->height, 1,
                                      &oi)) {
                 ow = oi.width;
                 oh = oi.height;
