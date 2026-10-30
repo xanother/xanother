@@ -75,13 +75,19 @@ static void on_event(x12c *c, const x12c_proxy *p,
             // shadow layer may push the next strip
             released = 1;
         } else {
-            // a retired buffer is off the surface, its first release
-            // is the permission to destroy
+            // a retired buffer is off the surface: its first release
+            // is the permission to destroy and the same credit every
+            // release carries, the previous frame left the screen and
+            // the shadow layer may push the next one. without the
+            // credit the gate dies after a buffer swap, the release of
+            // the fresh buffer needs a commit that itself waits on the
+            // gate
             for (int i = 0; i < buf_retired_n; i++) {
                 if (buf_retired[i] == p->id) {
                     x12c_call(session, "x12_buffer", "destroy", p->id,
                               0, 0);
                     buf_retired[i] = buf_retired[--buf_retired_n];
+                    released = 1;
                     break;
                 }
             }
