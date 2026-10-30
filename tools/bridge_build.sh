@@ -23,8 +23,9 @@ if [ ! -f build/build.ninja ]; then
     meson setup build -Dxorg=false -Dxephyr=false \
         -Dxnest=false -Dxvfb=false -Dxwayland=false -Dxquartz=false \
         -Dxwin=false -Dx12=true -Dglx=true -Dglamor=true -Ddocs=false \
-        -Dxdmcp=false -Dipv6=false -Dudev=false -Dudev_kms=false \
-        -Dinput_thread=false -Dxkb_dir=/usr/share/X11/xkb
+        -Ddri3=true -Dxdmcp=false -Dipv6=false -Dudev=false \
+        -Dudev_kms=false -Dinput_thread=false -Dxkb_dir=/usr/share/X11/xkb \
+        -Dxkb_bin_dir=/usr/bin
 fi
 ninja -C build
 echo "bridge: Xx12 at build/vendor/xserver/build/hw/x12/Xx12"
