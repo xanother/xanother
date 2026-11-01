@@ -302,8 +302,6 @@ x12PresentTimer(OsTimerPtr timer, CARD32 now, void *arg)
 {
     (void)now;
     (void)arg;
-    fprintf(stderr, "PDBG timer fire msc=%llu\n",
-            (unsigned long long)x12_present_msc);
     // returning zero frees the one shot timer, an explicit TimerFree
     // here would double free it
     x12_present_complete_all(GetTimeInMicros(), x12_present_msc + 1);
@@ -337,8 +335,6 @@ x12PresentQueueVblank(RRCrtcPtr crtc, uint64_t event_id, uint64_t msc)
         return BadAlloc;
     }
     struct x12_present_wait *w = &x12_present_pending[x12_present_np++];
-    fprintf(stderr, "PDBG queue id=%llu msc=%llu\n",
-            (unsigned long long)event_id, (unsigned long long)msc);
     w->event_id = event_id;
     w->timer = TimerSet(NULL, 0, x12_present_interval_ms(),
                         x12PresentTimer, &w->event_id);
@@ -396,7 +392,6 @@ void
 x12_present_flip_seen(uint64_t ts_ns, int is_flip)
 {
     if (is_flip && x12_present_np > 0) {
-        fprintf(stderr, "PDBG flip complete\n");
         x12_present_complete_all(ts_ns / 1000, x12_present_msc + 1);
         return;
     }
@@ -543,10 +538,9 @@ x12_pump_pixmap(ScreenPtr pScreen, PixmapPtr pix, RegionPtr rgn)
         for (int i = 0; i < n; i++) {
             int y0 = boxes[i].y1 < 0 ? 0 : boxes[i].y1;
             int y1 = boxes[i].y2 > (int)h ? (int)h : boxes[i].y2;
-            if (y1 > y0) {
-                x12_bridge_commit_rows(y0, y1);
-            }
+            x12_bridge_damage_rows(y0, y1);
         }
+        x12_bridge_commit();
         x12_glamor_target_flip();
         return;
     }
@@ -554,10 +548,9 @@ x12_pump_pixmap(ScreenPtr pScreen, PixmapPtr pix, RegionPtr rgn)
         for (int i = 0; i < n; i++) {
             int y0 = boxes[i].y1 < 0 ? 0 : boxes[i].y1;
             int y1 = boxes[i].y2 > (int)h ? (int)h : boxes[i].y2;
-            if (y1 > y0) {
-                x12_bridge_commit_rows(y0, y1);
-            }
+            x12_bridge_damage_rows(y0, y1);
         }
+        x12_bridge_commit();
         return;
     }
     if (!pix->devPrivate.ptr) {
@@ -578,10 +571,11 @@ x12_pump_pixmap(ScreenPtr pScreen, PixmapPtr pix, RegionPtr rgn)
             memcpy((unsigned char *)pool + (size_t)y * pitch,
                    bits + (size_t)y * stride, (size_t)w * 4);
         }
-        if (y1 > y0) {
-            x12_bridge_commit_rows(y0, y1);
-        }
+        x12_bridge_damage_rows(y0, y1);
     }
+    // one publish per flush: a commit per box shut the gate on the
+    // first box and every later box of the flush was silently dropped
+    x12_bridge_commit();
 }
 
 static void

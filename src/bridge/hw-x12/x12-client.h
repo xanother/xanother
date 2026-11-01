@@ -63,6 +63,8 @@ void x12_present_flip_seen(uint64_t ts_ns, int is_flip);
 
 // pushes the dirty row strip [y0, y1) to the server: damage plus
 // commit, the caller copies the rows into the pool first
+void x12_bridge_damage_rows(int y0, int y1);
+void x12_bridge_commit(void);
 void x12_bridge_commit_rows(int y0, int y1);
 
 // pending configure from the server, nonzero when one was offered;

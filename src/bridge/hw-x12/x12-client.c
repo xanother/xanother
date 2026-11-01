@@ -505,7 +505,11 @@ int x12_bridge_gate_open(void)
     return released != 0 && pool_pix != NULL;
 }
 
-void x12_bridge_commit_rows(int y0, int y1)
+// a damage mark only: the surface accumulates the rows, the commit
+// that follows publishes them all at once. the pump runs one commit
+// per flush - a commit per box closed the gate on the first box and
+// the rest of the flush silently never reached the server
+void x12_bridge_damage_rows(int y0, int y1)
 {
     if (y0 < 0) {
         y0 = 0;
@@ -513,7 +517,7 @@ void x12_bridge_commit_rows(int y0, int y1)
     if (y1 > (int)surf_h) {
         y1 = (int)surf_h;
     }
-    if (y0 >= y1 || !x12_bridge_gate_open()) {
+    if (y0 >= y1) {
         return;
     }
     x12_arg d[4] = {
@@ -522,11 +526,26 @@ void x12_bridge_commit_rows(int y0, int y1)
         { .i64 = (int32_t)surf_w },
         { .i64 = (uint32_t)(y1 - y0) },
     };
-    if (x12c_call(session, "x12_surface", "damage", surf_id, d, 4) != 0 ||
-        x12c_call(session, "x12_surface", "commit", surf_id, 0, 0) != 0) {
+    x12c_call(session, "x12_surface", "damage", surf_id, d, 4);
+}
+
+// the publish: every marked row goes to the server in one frame and
+// the gate shuts until the server releases the buffer again
+void x12_bridge_commit(void)
+{
+    if (!x12_bridge_gate_open()) {
+        return;
+    }
+    if (x12c_call(session, "x12_surface", "commit", surf_id, 0, 0) != 0) {
         return;
     }
     released = 0;
+}
+
+void x12_bridge_commit_rows(int y0, int y1)
+{
+    x12_bridge_damage_rows(y0, y1);
+    x12_bridge_commit();
 }
 
 int x12_bridge_take_configure(uint32_t *w, uint32_t *h)
