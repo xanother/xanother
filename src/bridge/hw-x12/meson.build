@@ -11,6 +11,7 @@ srcs = [
     'x12-client.c',
     'x12-glamor.c',
     'x12-dri3.c',
+    'x12-isolate.c',
     'libx12.c',
     'x12_wire.c',
     'x12_tables.c',

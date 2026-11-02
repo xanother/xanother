@@ -36,6 +36,7 @@
 #include "x12-client.h"
 #include "x12-dri3.h"
 #include "x12-glamor.h"
+#include "x12-isolate.h"
 #include "glamor.h"
 
 #define X12_DEFAULT_W 800
@@ -995,6 +996,9 @@ InitOutput(ScreenInfo *screen_info, int argc, char **argv)
         FatalError("Xx12: the X12 server at %s refused the handshake",
                    sock);
     }
+
+    // the isolation hooks go in before the first x client can knock
+    x12_isolate_init();
 
     const char *w = getenv("X12_BRIDGE_WIDTH");
     const char *h = getenv("X12_BRIDGE_HEIGHT");
