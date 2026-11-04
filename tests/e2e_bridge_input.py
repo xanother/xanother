@@ -71,7 +71,11 @@ def main():
             env={"PATH": "/usr/bin:/bin",
                  "X12_BRIDGE_SOCKET": str(SOCK),
                  "X12_BRIDGE_WIDTH": "768",
-                 "X12_BRIDGE_HEIGHT": "448"})
+                 "X12_BRIDGE_HEIGHT": "448",
+                 # the test polls the window tree with xwininfo to know
+                 # when xterm mapped - under the isolation cloak that
+                 # poll needs the tool grant
+                 "X12_BRIDGE_GRANTS": "xwininfo"})
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline and not xsock.exists():
             time.sleep(0.05)

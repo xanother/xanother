@@ -77,7 +77,10 @@ def main():
         bridge = subprocess.Popen(
             [str(BRIDGE), f":{display}", "-ac", "-noreset"],
             stdout=f, stderr=f,
-            env={"PATH": "/usr/bin:/bin", "X12_BRIDGE_SOCKET": str(SOCK)})
+            env={"PATH": "/usr/bin:/bin", "X12_BRIDGE_SOCKET": str(SOCK),
+                 # the manual mode set grabs the server, that is a
+                 # manager move - the tool grant covers it
+                 "X12_BRIDGE_GRANTS": "xrandr"})
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline and not xsock.exists():
             time.sleep(0.05)
