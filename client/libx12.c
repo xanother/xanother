@@ -9,6 +9,7 @@
 
 #include "libx12.h"
 #include "x12_protocol.h"
+#include "x12_net.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -33,6 +34,10 @@
 
 struct x12c {
     int fd;
+    // tls connection object on tls transports, NULL otherwise
+    void *tls;
+    // 1 on tcp and tls: fd passing does not exist there
+    int net;
     x12c_handler handler;
     x12c_proxy proxies[X12C_MAX_PROXIES];
     struct {
@@ -84,7 +89,11 @@ static int flush_out(struct x12c *c) {
     size_t off = 0;
     while (off < c->out_len) {
         ssize_t n;
-        if (c->n_out_fds > 0) {
+        if (c->tls || c->net) {
+            // fd passing does not exist past unix sockets
+            n = x12_net_write(c->tls, c->fd, c->out + off, c->out_len - off);
+        }
+        else if (c->n_out_fds > 0) {
             union {
                 char buf[CMSG_SPACE(sizeof(int) * X12C_MAX_FDS)];
                 struct cmsghdr align;
@@ -108,7 +117,7 @@ static int flush_out(struct x12c *c) {
             }
             c->n_out_fds = 0;
         } else {
-            n = send(c->fd, c->out + off, c->out_len - off, MSG_NOSIGNAL);
+            n = x12_net_write(NULL, c->fd, c->out + off, c->out_len - off);
         }
         if (n <= 0) {
             return -1;
@@ -124,20 +133,21 @@ x12c *x12c_connect(const char *path, x12c_handler handler) {
     if (!c) {
         return 0;
     }
-    c->fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    // a bare path dials a unix socket, tcp: and tls: dial the network
+    // transports. the session above is identical on all three
+    struct x12_net_addr addr;
+    void *tls = NULL;
+    if (x12_net_parse(path, &addr) != 0) {
+        free(c);
+        return 0;
+    }
+    c->fd = x12_net_connect(&addr, &tls);
     if (c->fd < 0) {
         free(c);
         return 0;
     }
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof addr);
-    addr.sun_family = AF_UNIX;
-    snprintf(addr.sun_path, sizeof addr.sun_path, "%s", path);
-    if (connect(c->fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
-        close(c->fd);
-        free(c);
-        return 0;
-    }
+    c->tls = tls;
+    c->net = addr.kind != X12_NET_UNIX;
     c->handler = handler;
     // the handshake objects carry the fixed ids of the convention, a
     // connect is enough to talk to connection and registry
@@ -236,6 +246,12 @@ int x12c_callfd(x12c *c, const char *iface_name, const char *request,
     // the call owns the descriptor from here on, it is closed exactly
     // once on every path. a caller close after this would race the fd
     // number against the next open
+    if (c->net) {
+        // no scm rights on the network transports, the remote pool
+        // story is a payload channel of its own
+        close(fd);
+        return -1;
+    }
     if (c->n_out_fds >= X12C_MAX_FDS) {
         close(fd);
         return -1;
@@ -406,8 +422,8 @@ static int pump_once(struct x12c *c) {
         return -1;
     }
     while (c->in_len < size) {
-        ssize_t n = recv(c->fd, c->in + c->in_len, size - c->in_len,
-                         MSG_NOSIGNAL);
+        ssize_t n = x12_net_read(c->tls, c->fd, c->in + c->in_len,
+                                 size - c->in_len);
         if (n <= 0) {
             return -1;
         }

@@ -16,6 +16,7 @@ DRM_CFLAGS=$(pkg-config --cflags libdrm 2>/dev/null)
 gcc $CFLAGS $DRM_CFLAGS -o build/x12-server \
     src/server/main.c \
     src/core/conn.c \
+    src/wire/x12_net.c \
     src/core/objects.c \
     src/core/output.c \
     src/core/dispatch.c \
@@ -33,7 +34,7 @@ gcc $CFLAGS $DRM_CFLAGS -o build/x12-server \
     src/backend/backend_headless.c src/backend/backend_kms.c \
     src/wire/x12_wire.c \
     build/gen/x12_tables.c \
-    -lxkbcommon -ldl -ldrm -ludev
+    -lxkbcommon -ldl -ldrm -ludev -lssl -lcrypto
 
 gcc $CFLAGS -o build/c_roundtrip \
     tests/c_roundtrip.c \
@@ -63,7 +64,8 @@ gcc $CLIENT -o build/welcome \
     client/welcome.c \
     client/libx12.c \
     src/wire/x12_wire.c \
-    build/gen/x12_tables.c
+    src/wire/x12_net.c \
+    build/gen/x12_tables.c -lssl -lcrypto
 
 gcc $CLIENT -o build/x12-term \
     client/terminal/x12-term.c \
@@ -71,7 +73,8 @@ gcc $CLIENT -o build/x12-term \
     client/terminal/term_vt.c \
     client/libx12.c \
     src/wire/x12_wire.c \
+    src/wire/x12_net.c \
     build/gen/x12_tables.c \
-    -lxkbcommon -lutil
+    -lxkbcommon -lutil -lssl -lcrypto
 
 echo "build ok"

@@ -8,13 +8,17 @@
 #include <stdint.h>
 
 #include "x12_wire.h"
-#include "limits.h"
+#include "x12_limits.h"
 #include "objects.h"
 
 // one connected client: io buffers, fd queues, capability bits and the
 // object table. the struct carries every limit the connection can hit
 struct x12_conn {
     int fd;
+    // tls connection object on tls transports, NULL otherwise
+    void *tls;
+    // 1 on tcp and tls: no scm rights exists there, fd passing refuses
+    int net;
     uint8_t in[X12_IO_BUF];
     size_t in_len;
     uint8_t out[X12_IO_BUF];

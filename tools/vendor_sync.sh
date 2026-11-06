@@ -37,5 +37,6 @@ mkdir -p "$VENDOR/hw/x12"
 cp src/bridge/hw-x12/*.c src/bridge/hw-x12/*.h \
    src/bridge/hw-x12/meson.build "$VENDOR/hw/x12/"
 cp client/libx12.c client/libx12.h src/wire/x12_wire.c src/wire/x12_wire.h \
+   src/wire/x12_net.c src/wire/x12_net.h \
    build/gen/x12_protocol.h build/gen/x12_tables.c "$VENDOR/hw/x12/"
 echo "vendor: bridge sources synced"

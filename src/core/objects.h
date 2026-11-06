@@ -7,7 +7,7 @@
 #include <stdint.h>
 
 #include "x12_wire.h"
-#include "limits.h"
+#include "x12_limits.h"
 #include "state.h"
 
 // object kinds the core skeleton knows, later parties hang their state

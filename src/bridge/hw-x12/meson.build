@@ -14,6 +14,7 @@ srcs = [
     'x12-isolate.c',
     'libx12.c',
     'x12_wire.c',
+    'x12_net.c',
     'x12_tables.c',
     '../../mi/miinitext.c',
 ]
@@ -22,7 +23,8 @@ x12_server = executable(
     'Xx12',
     srcs,
     include_directories: [inc, include_directories('../../dri3')],
-    dependencies: [common_dep, dependency('libdrm'), dependency('gbm')],
+    dependencies: [common_dep, dependency('libdrm'), dependency('gbm'),
+                   dependency('openssl')],
     link_with: [
         libxserver_main,
         libxserver_fb,

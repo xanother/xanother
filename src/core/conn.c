@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "x12_protocol.h"
+#include "x12_net.h"
 
 uint64_t x12_now_ns(void) {
     struct timespec ts;
@@ -21,6 +22,8 @@ uint64_t x12_now_ns(void) {
 void x12_conn_init(struct x12_conn *c, int fd) {
     memset(c, 0, sizeof *c);
     c->fd = fd;
+    // the caller attaches the tls object and the net flag for network
+    // transports right after, unix starts with fd passing live
     x12_objects_init(&c->objects);
     // well known singletons, the client talks to them before anything else
     x12_objects_alloc(&c->objects, X12_OBJ_ID_CONNECTION,
@@ -147,7 +150,13 @@ void x12_conn_flush(struct x12_conn *c) {
     size_t off = 0;
     while (off < c->out_len) {
         ssize_t n;
-        if (c->n_out_fds > 0) {
+        if (c->tls || c->net) {
+            // fd passing does not exist past unix sockets, the events
+            // that must carry one are refused upstream. the bytes
+            // themselves travel the same
+            n = x12_net_write(c->tls, c->fd, c->out + off, c->out_len - off);
+        }
+        else if (c->n_out_fds > 0) {
             union { char buf[CMSG_SPACE(sizeof(int) * X12_MAX_FDS)]; struct cmsghdr align; } ctl;
             memset(ctl.buf, 0, sizeof ctl.buf);
             struct iovec iov = { c->out + off, c->out_len - off };
@@ -170,7 +179,7 @@ void x12_conn_flush(struct x12_conn *c) {
             }
             c->n_out_fds = 0;
         } else {
-            n = send(c->fd, c->out + off, c->out_len - off, MSG_NOSIGNAL);
+            n = x12_net_write(NULL, c->fd, c->out + off, c->out_len - off);
         }
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             // the kernel buffer is full, the remainder stays queued until
@@ -198,21 +207,29 @@ int x12_conn_read(struct x12_conn *c,
     if (c->dead) {
         return -1;
     }
-    struct iovec iov = {
-        c->in + c->in_len,
-        X12_IO_BUF - c->in_len,
-    };
+    ssize_t n;
+    struct msghdr mh;
     union {
         struct cmsghdr h;
         uint8_t buf[CMSG_SPACE(sizeof(int) * X12_MAX_FDS)];
     } ctl;
-    struct msghdr mh;
-    memset(&mh, 0, sizeof mh);
-    mh.msg_iov = &iov;
-    mh.msg_iovlen = 1;
-    mh.msg_control = ctl.buf;
-    mh.msg_controllen = sizeof ctl.buf;
-    ssize_t n = recvmsg(c->fd, &mh, 0);
+    struct iovec iov = {
+        c->in + c->in_len,
+        X12_IO_BUF - c->in_len,
+    };
+    if (c->tls || c->net) {
+        // no scm rights on the network transports
+        memset(&mh, 0, sizeof mh);
+        n = x12_net_read(c->tls, c->fd, iov.iov_base, iov.iov_len);
+    }
+    else {
+        memset(&mh, 0, sizeof mh);
+        mh.msg_iov = &iov;
+        mh.msg_iovlen = 1;
+        mh.msg_control = ctl.buf;
+        mh.msg_controllen = sizeof ctl.buf;
+        n = recvmsg(c->fd, &mh, 0);
+    }
     if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
         // non blocking socket, the rest of the frame arrives later and
         // the buffered prefix must survive until then

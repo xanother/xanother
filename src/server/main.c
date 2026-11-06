@@ -1,8 +1,9 @@
 // Copyright (c) lezginskiy <xanother-x12@proton.me>
 // SPDX-License-Identifier: MIT
 
-// entry point: unix socket, poll loop, accepts clients and hands their
-// frames to the dispatch table. this file owns no protocol logic
+// entry point: a unix socket, a tcp port or a tls port, poll loop,
+// accepts clients and hands their frames to the dispatch table. this
+// file owns no protocol logic
 
 #include <errno.h>
 #include <poll.h>
@@ -17,7 +18,7 @@
 #include "conn.h"
 #include "dispatch.h"
 #include "handlers.h"
-#include "limits.h"
+#include "x12_limits.h"
 #include "output.h"
 #include "buffer.h"
 #include "frame.h"
@@ -28,6 +29,7 @@
 #include "gpu.h"
 #include "source.h"
 #include "selection.h"
+#include "x12_net.h"
 
 const struct x12_backend_ops *x12_backend;
 
@@ -58,24 +60,6 @@ static volatile sig_atomic_t running = 1;
 static void on_term(int sig) {
     (void)sig;
     running = 0;
-}
-
-static int make_socket(const char *path) {
-    int s = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (s < 0) {
-        return -1;
-    }
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof addr);
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, path, sizeof addr.sun_path - 1);
-    unlink(path);
-    if (bind(s, (struct sockaddr *)&addr, sizeof addr) != 0 ||
-        listen(s, 8) != 0) {
-        close(s);
-        return -1;
-    }
-    return s;
 }
 
 // cables move while the server runs: outputs announce themselves, dead
@@ -147,9 +131,17 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &sa, 0);
     signal(SIGPIPE, SIG_IGN);
 
-    int srv = make_socket(sock_path);
+    // the positional argument is an address: a bare path or unix: for
+    // a local socket, tcp:HOST:PORT and tls:HOST:PORT for the network
+    // transports. the wire above never learns which one it got
+    struct x12_net_addr addr;
+    void *tls_ctx = NULL;
+    if (x12_net_parse(sock_path, &addr) != 0) {
+        fprintf(stderr, "x12-server: bad listen address %s\n", sock_path);
+        return 1;
+    }
+    int srv = x12_net_listen(&addr, &tls_ctx);
     if (srv < 0) {
-        perror("socket");
         return 1;
     }
     if (x12_backend->init(argc, argv) != 0) {
@@ -157,7 +149,9 @@ int main(int argc, char **argv) {
         close(srv);
         // the socket file stays behind otherwise and the next spawn
         // connects into the void instead of a fresh server
-        unlink(sock_path);
+        if (addr.kind == X12_NET_UNIX) {
+            unlink(addr.path);
+        }
         return 1;
     }
     uint32_t canvas_w = 0, canvas_h = 0;
@@ -285,7 +279,14 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "x12-server: refusing client, connection limit\n");
                     close(fd);
                 } else {
-                    x12_conn_init(&conns[i], fd);
+                    void *tls = NULL;
+                    if (x12_net_accept(tls_ctx, &addr, fd, &tls) != 0) {
+                        close(fd);
+                    } else {
+                        x12_conn_init(&conns[i], fd);
+                        conns[i].tls = tls;
+                        conns[i].net = addr.kind != X12_NET_UNIX;
+                    }
                 }
             }
         }
@@ -352,7 +353,9 @@ int main(int argc, char **argv) {
     x12_gpu_shutdown();
     x12_backend->shutdown();
     close(srv);
-    unlink(sock_path);
+    if (addr.kind == X12_NET_UNIX) {
+        unlink(addr.path);
+    }
     fprintf(stderr, "x12-server: bye\n");
     return 0;
 }
