@@ -32,11 +32,15 @@ def spawn_server(binary, sock_path, extra_args=(), stderr=subprocess.PIPE):
 class Session:
     # one connected client with its object id registry, ids must be
     # registered before events for them arrive, unknown ids are a test bug
-    def __init__(self, sock_path, idl):
+    def __init__(self, sock_path, idl, sock=None):
         self.idl = idl
         self.ifaces = {1: "x12_connection", 2: "x12_registry"}
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.connect(str(sock_path))
+        if sock is not None:
+            # a network transport dials its own socket and hands it over
+            self.sock = sock
+        else:
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.connect(str(sock_path))
         self.sock.settimeout(5)
         self.buf = b""
         self.events = []
@@ -78,8 +82,12 @@ class Session:
 
     def _recv_more(self):
         # recvmsg so scm rights fds land in recv_fds instead of dying
-        # unread; plain recv silently drops them on linux
-        chunk, anc, _, _ = self.sock.recvmsg(65536, 256)
+        # unread; plain recv silently drops them on linux. tls sockets
+        # have no recvmsg at all, they never carry fds
+        try:
+            chunk, anc, _, _ = self.sock.recvmsg(65536, 256)
+        except (AttributeError, NotImplementedError):
+            chunk, anc = self.sock.recv(65536), ()
         if not chunk:
             raise AssertionError("server closed the connection")
         self.buf += chunk
