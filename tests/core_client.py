@@ -9,9 +9,41 @@ import socket
 import struct
 import subprocess
 import time
+import zlib
 from pathlib import Path
 
 from tests import wire_model as wm
+
+# frame envelope for the network transports, mirrors x12_net_wrap and
+# x12_net_peel in the server: [u32 hdr][u32 raw_len][data], the high
+# bit of hdr marks raw data, clear means a zlib stream
+_NET_RAW_FLAG = 0x80000000
+_NET_COMPRESS_MIN = 512
+
+
+def net_wrap(frame):
+    hdr = _NET_RAW_FLAG | len(frame)
+    data = frame
+    if len(frame) >= _NET_COMPRESS_MIN:
+        comp = zlib.compress(frame, 6)
+        if len(comp) < len(frame):
+            hdr, data = len(comp), comp
+    return struct.pack("<II", hdr, len(frame)) + data
+
+
+def net_peel(buf):
+    # pulls every complete envelope out of buf, returns (frames, rest)
+    frames = []
+    off = 0
+    while len(buf) - off >= 8:
+        hdr, raw_len = struct.unpack_from("<II", buf, off)
+        data_len = hdr & ~_NET_RAW_FLAG
+        if 8 + data_len > len(buf) - off:
+            break
+        chunk = buf[off + 8:off + 8 + data_len]
+        frames.append(chunk if hdr & _NET_RAW_FLAG else zlib.decompress(chunk))
+        off += 8 + data_len
+    return frames, buf[off:]
 
 
 def spawn_server(binary, sock_path, extra_args=(), stderr=subprocess.PIPE):
@@ -38,6 +70,8 @@ class Session:
         if sock is not None:
             # a network transport dials its own socket and hands it over
             self.sock = sock
+            self.net = sock.family != socket.AF_UNIX
+            self.netbuf = b""
         else:
             self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self.sock.connect(str(sock_path))
@@ -52,6 +86,10 @@ class Session:
         self.sock.close()
 
     def send_raw(self, data, fds=()):
+        if getattr(self, "net", False):
+            # envelopes carry every frame on the network transports
+            self.sock.sendall(net_wrap(data))
+            return
         if not fds:
             self.sock.sendall(data)
             return
@@ -90,6 +128,12 @@ class Session:
             chunk, anc = self.sock.recv(65536), ()
         if not chunk:
             raise AssertionError("server closed the connection")
+        if getattr(self, "net", False):
+            # envelopes peel into whole frames for the parser
+            self.netbuf += chunk
+            frames, self.netbuf = net_peel(self.netbuf)
+            self.buf += b"".join(frames)
+            return
         self.buf += chunk
         for level, typ, data in anc:
             if level == socket.SOL_SOCKET and typ == socket.SCM_RIGHTS:

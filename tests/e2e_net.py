@@ -9,6 +9,7 @@
 import os
 import socket
 import ssl
+import time
 import subprocess
 import sys
 import time
@@ -18,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from tools.x12gen import load_idl  # noqa: E402
+from tests import wire_model as wm  # noqa: E402
 from tests import core_client as cc  # noqa: E402
 
 BUILD = ROOT / "build"
@@ -93,6 +95,61 @@ def session_dance(s):
     assert err["args"]["code"] == "no-capability", err
 
 
+def big_frame_roundtrip(s):
+    # a payload past the compression threshold rides the zlib path and
+    # still lands as one request, the answer comes back the same way
+    s.request("x12_registry", "bind", 2,
+              name="no-such-global-" + "x" * 60000,
+              version=1, id=21, instance=0)
+    err = s.wait_for("error")
+    assert err["args"]["code"] == "bad-value", err
+
+
+def slow_client_kill(idl, addr):
+    # the backpressure policy from the old server: a client that stops
+    # reading its events is disconnected loudly, events are never
+    # dropped to fake progress. the flood fills the kernel buffer and
+    # then the 64k out buffer, the reap follows
+    port = int(addr.rsplit(":", 1)[1])
+    raw = socket.create_connection(("127.0.0.1", port), timeout=5)
+    s = cc.Session(addr, idl, sock=raw)
+    handshake(s)
+    batch = b""
+    frames = 0
+    killed = False
+    try:
+        for i in range(20000):
+            batch += wm.encode_request(idl, "x12_registry", "bind", 2,
+                                       name="nope", version=1,
+                                       id=25 + (i % 3), instance=0)
+            frames += 1
+            if len(batch) >= 65536:
+                s.sock.sendall(batch)
+                batch = b""
+        if batch:
+            s.sock.sendall(batch)
+    except (BrokenPipeError, ConnectionResetError):
+        # the loud disconnect reached us mid flood
+        killed = True
+    # no reads at all above: the server eventually gives up on us
+    if not killed:
+        deadline = time.monotonic() + 10
+        s.sock.settimeout(1)
+        while time.monotonic() < deadline:
+            try:
+                if not s.sock.recv(4096):
+                    killed = True
+                    break
+            except (socket.timeout, ConnectionResetError):
+                continue
+            except OSError:
+                killed = True
+                break
+    assert killed, "slow client was never disconnected"
+    s.sock.close()
+    return frames
+
+
 def fd_refusal(s):
     # a shm pool needs a passed descriptor, the network transports have
     # none and the refusal is a clean bad-value, not a hang
@@ -116,7 +173,9 @@ def main():
         handshake(s)
         session_dance(s)
         fd_refusal(s)
+        big_frame_roundtrip(s)
         s.close()
+        slow_client_kill(idl, f"tcp:127.0.0.1:{port}")
     finally:
         proc.terminate()
         proc.wait(timeout=5)

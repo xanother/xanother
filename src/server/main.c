@@ -308,6 +308,8 @@ int main(int argc, char **argv) {
                 // a loud disconnect names its reason
                 x12_conn_flush(c);
                 client_teardown(c);
+                x12_net_tls_free(c->tls);
+                c->tls = 0;
                 close(c->fd);
                 c->fd = -1;
             }
@@ -324,6 +326,8 @@ int main(int argc, char **argv) {
             if (conns[i].dead && conns[i].fd >= 0) {
                 x12_conn_flush(&conns[i]);
                 client_teardown(&conns[i]);
+                x12_net_tls_free(conns[i].tls);
+                conns[i].tls = 0;
                 close(conns[i].fd);
                 conns[i].fd = -1;
             }

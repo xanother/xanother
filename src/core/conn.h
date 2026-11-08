@@ -19,6 +19,10 @@ struct x12_conn {
     void *tls;
     // 1 on tcp and tls: no scm rights exists there, fd passing refuses
     int net;
+    // envelope staging for the network transports, allocated on first
+    // use. bytes arrive framed as [hdr][raw_len][data] and peel into in
+    uint8_t *netbuf;
+    size_t netbuf_len;
     uint8_t in[X12_IO_BUF];
     size_t in_len;
     uint8_t out[X12_IO_BUF];

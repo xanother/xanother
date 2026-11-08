@@ -11,6 +11,8 @@
 #include <unistd.h>
 
 #include "x12_protocol.h"
+#include <stdlib.h>
+
 #include "x12_net.h"
 
 uint64_t x12_now_ns(void) {
@@ -18,6 +20,9 @@ uint64_t x12_now_ns(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
+
+// one scratch frame per encode, the server is single threaded
+static uint8_t frame_scratch[X12_IO_BUF];
 
 void x12_conn_init(struct x12_conn *c, int fd) {
     memset(c, 0, sizeof *c);
@@ -37,6 +42,9 @@ void x12_conn_kill(struct x12_conn *c, const char *why) {
         return;
     }
     c->dead = 1;
+    free(c->netbuf);
+    c->netbuf = 0;
+    c->netbuf_len = 0;
     fprintf(stderr, "x12-server: disconnecting client fd %d, %s\n",
             c->fd, why);
 }
@@ -97,8 +105,8 @@ int x12_conn_event_ts(struct x12_conn *c, const x12_iface_desc *iface,
     }
     size_t written = 0;
     int rc = x12_encode(iface, msg, object, ts,
-                        args, nargs, c->out + c->out_len,
-                        X12_IO_BUF - c->out_len, &written);
+                        args, nargs, frame_scratch, sizeof frame_scratch,
+                        &written);
     if (rc == X12_ERR_CAP) {
         // the client stopped reading its events, dropping them would
         // fake progress so the connection dies loudly instead
@@ -109,7 +117,16 @@ int x12_conn_event_ts(struct x12_conn *c, const x12_iface_desc *iface,
         x12_conn_kill(c, "event encode failed");
         return -1;
     }
-    c->out_len += written;
+    // network transports pay the envelope cost, compression inside it
+    // keeps the big payloads small on the wire
+    size_t wrapped = x12_net_wrap(c->net, c->out + c->out_len,
+                                  X12_IO_BUF - c->out_len,
+                                  frame_scratch, written);
+    if (wrapped == 0) {
+        x12_conn_kill(c, "out buffer full");
+        return -1;
+    }
+    c->out_len += wrapped;
     return 0;
 }
 
@@ -209,6 +226,17 @@ int x12_conn_read(struct x12_conn *c,
     }
     ssize_t n;
     struct msghdr mh;
+    if (c->net) {
+        // the envelope staging grows once per network connection and
+        // only ever holds bytes that have not peeled into in yet
+        if (!c->netbuf) {
+            c->netbuf = malloc(X12_NET_STAGING);
+            if (!c->netbuf) {
+                x12_conn_kill(c, "out of memory");
+                return -1;
+            }
+        }
+    }
     union {
         struct cmsghdr h;
         uint8_t buf[CMSG_SPACE(sizeof(int) * X12_MAX_FDS)];
@@ -220,6 +248,12 @@ int x12_conn_read(struct x12_conn *c,
     if (c->tls || c->net) {
         // no scm rights on the network transports
         memset(&mh, 0, sizeof mh);
+        if (c->net) {
+            // envelopes land in the staging area and peel into in as
+            // whole frames
+            iov.iov_base = c->netbuf + c->netbuf_len;
+            iov.iov_len = X12_NET_STAGING - c->netbuf_len;
+        }
         n = x12_net_read(c->tls, c->fd, iov.iov_base, iov.iov_len);
     }
     else {
@@ -240,7 +274,18 @@ int x12_conn_read(struct x12_conn *c,
         x12_conn_kill(c, "peer closed");
         return -1;
     }
-    c->in_len += (size_t)n;
+    if (c->net) {
+        c->netbuf_len += (size_t)n;
+        if (x12_net_peel(c->netbuf, &c->netbuf_len,
+                         c->in, &c->in_len, X12_IO_BUF) != 0) {
+            x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, 0);
+            x12_conn_kill(c, "bad frame envelope");
+            return -1;
+        }
+    }
+    else {
+        c->in_len += (size_t)n;
+    }
     for (struct cmsghdr *cm = CMSG_FIRSTHDR(&mh); cm; cm = CMSG_NXTHDR(&mh, cm)) {
         if (cm->cmsg_level != SOL_SOCKET || cm->cmsg_type != SCM_RIGHTS) {
             continue;

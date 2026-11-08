@@ -24,7 +24,8 @@ x12_server = executable(
     srcs,
     include_directories: [inc, include_directories('../../dri3')],
     dependencies: [common_dep, dependency('libdrm'), dependency('gbm'),
-                   dependency('openssl')],
+                   dependency('openssl'),
+                   dependency('zlib')],
     link_with: [
         libxserver_main,
         libxserver_fb,

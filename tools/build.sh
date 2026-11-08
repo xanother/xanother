@@ -34,7 +34,7 @@ gcc $CFLAGS $DRM_CFLAGS -o build/x12-server \
     src/backend/backend_headless.c src/backend/backend_kms.c \
     src/wire/x12_wire.c \
     build/gen/x12_tables.c \
-    -lxkbcommon -ldl -ldrm -ludev -lssl -lcrypto
+    -lxkbcommon -ldl -ldrm -ludev -lssl -lcrypto -lz
 
 gcc $CFLAGS -o build/c_roundtrip \
     tests/c_roundtrip.c \
@@ -65,7 +65,7 @@ gcc $CLIENT -o build/welcome \
     client/libx12.c \
     src/wire/x12_wire.c \
     src/wire/x12_net.c \
-    build/gen/x12_tables.c -lssl -lcrypto
+    build/gen/x12_tables.c -lssl -lcrypto -lz
 
 gcc $CLIENT -o build/x12-term \
     client/terminal/x12-term.c \
@@ -75,6 +75,6 @@ gcc $CLIENT -o build/x12-term \
     src/wire/x12_wire.c \
     src/wire/x12_net.c \
     build/gen/x12_tables.c \
-    -lxkbcommon -lutil -lssl -lcrypto
+    -lxkbcommon -lutil -lssl -lcrypto -lz
 
 echo "build ok"

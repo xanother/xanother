@@ -54,6 +54,9 @@ struct x12c {
     size_t n_out_fds;
     uint8_t in[X12C_IN_CAP];
     size_t in_len;
+    // envelope staging for the network transports
+    uint8_t *netbuf;
+    size_t netbuf_len;
     int fd_slots[X12C_MAX_FDS];
     int n_fd_slots;
     // the implicit nanosecond timestamp of the event being dispatched,
@@ -76,12 +79,19 @@ static int encode_into(struct x12c *c, const char *iface_name,
     if (!iface || !m) {
         return -1;
     }
+    static uint8_t scratch[X12C_OUT_CAP];
     size_t len = 0;
-    if (x12_encode(iface, m, object, 0, args, nargs, c->out + c->out_len,
-                   sizeof c->out - c->out_len, &len) != X12_OK) {
+    if (x12_encode(iface, m, object, 0, args, nargs,
+                   scratch, sizeof scratch, &len) != X12_OK) {
         return -1;
     }
-    c->out_len += len;
+    size_t wrapped = x12_net_wrap(c->net, c->out + c->out_len,
+                                  sizeof c->out - c->out_len,
+                                  scratch, len);
+    if (wrapped == 0) {
+        return -1;
+    }
+    c->out_len += wrapped;
     return 0;
 }
 
@@ -173,7 +183,9 @@ void x12c_close(x12c *c) {
     for (int i = 0; i < c->n_fd_slots; i++) {
         close(c->fd_slots[i]);
     }
+    x12_net_tls_free(c->tls);
     close(c->fd);
+    free(c->netbuf);
     free(c);
 }
 
@@ -387,7 +399,30 @@ static int feed_ready(struct x12c *c) {
 }
 
 static int pump_once(struct x12c *c) {
-    while (c->in_len < X12_HEADER_SIZE) {
+    if (c->net) {
+        // envelopes arrive whole in the staging area and peel into in
+        // as complete frames, a frame is never split across peels
+        if (!c->netbuf) {
+            c->netbuf = malloc(X12C_IN_CAP + 16);
+            if (!c->netbuf) {
+                return -1;
+            }
+        }
+        while (c->in_len < X12_HEADER_SIZE) {
+            ssize_t n = x12_net_read(c->tls, c->fd,
+                                     c->netbuf + c->netbuf_len,
+                                     X12C_IN_CAP + 16 - c->netbuf_len);
+            if (n <= 0) {
+                return -1;
+            }
+            c->netbuf_len += (size_t)n;
+            if (x12_net_peel(c->netbuf, &c->netbuf_len,
+                             c->in, &c->in_len, sizeof c->in) != 0) {
+                return -1;
+            }
+        }
+    }
+    while (!c->net && c->in_len < X12_HEADER_SIZE) {
         struct iovec iov = { c->in + c->in_len, sizeof c->in - c->in_len };
         union {
             char buf[CMSG_SPACE(sizeof(int) * 4)];
@@ -421,7 +456,7 @@ static int pump_once(struct x12c *c) {
     if (size < X12_HEADER_SIZE || size > sizeof c->in) {
         return -1;
     }
-    while (c->in_len < size) {
+    while (!c->net && c->in_len < size) {
         ssize_t n = x12_net_read(c->tls, c->fd, c->in + c->in_len,
                                  size - c->in_len);
         if (n <= 0) {
