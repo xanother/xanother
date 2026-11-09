@@ -162,6 +162,11 @@ static int arg_size(const x12_arg_desc *ad, const x12_arg *a, size_t *out) {
         if (!utf8_valid(a->str, a->str_len)) {
             return X12_ERR_ARG;
         }
+        // fall through
+    case X12_ARG_BYTES:
+        if (!a->str) {
+            return X12_ERR_ARG;
+        }
         *out = 4 + align4(a->str_len);
         return X12_OK;
     case X12_ARG_ARRAY_U32:
@@ -194,7 +199,8 @@ static size_t arg_write(const x12_arg_desc *ad, const x12_arg *a, uint8_t *p) {
     case X12_ARG_INT64:
         wr_u64(p, (uint64_t)a->i64);
         return 8;
-    case X12_ARG_STRING: {
+    case X12_ARG_STRING:
+    case X12_ARG_BYTES: {
         wr_u32(p, a->str_len);
         memcpy(p + 4, a->str, a->str_len);
         memset(p + 4 + a->str_len, 0, align4(a->str_len) - a->str_len);
@@ -344,7 +350,8 @@ int x12_decode(const x12_iface_desc *iface, const x12_msg_desc *msg,
             a->i64 = (int64_t)rd_u64(off - 8);
             break;
         }
-        case X12_ARG_STRING: {
+        case X12_ARG_STRING:
+        case X12_ARG_BYTES: {
             int rc = need(&off, &left, 4);
             if (rc != X12_OK) {
                 return rc;
@@ -356,13 +363,16 @@ int x12_decode(const x12_iface_desc *iface, const x12_msg_desc *msg,
                 return rc;
             }
             const char *s = (const char *)(off - slen);
-            for (uint32_t k = 0; k < slen; k++) {
-                if (s[k] == '\0') {
+            if (ad->type == X12_ARG_STRING) {
+                // raw bytes take anything, strings stay printable text
+                for (uint32_t k = 0; k < slen; k++) {
+                    if (s[k] == '\0') {
+                        return X12_ERR_FRAME;
+                    }
+                }
+                if (!utf8_valid(s, slen)) {
                     return X12_ERR_FRAME;
                 }
-            }
-            if (!utf8_valid(s, slen)) {
-                return X12_ERR_FRAME;
             }
             // padding sits right after the payload, checked before consuming
             for (size_t k = 0; k < pad; k++) {

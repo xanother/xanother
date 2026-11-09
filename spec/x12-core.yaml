@@ -30,6 +30,7 @@ protocol:
     - uint32, int32, uint64, int64
     - fixed24p8   # sign, 24 integer bits, 8 fraction bits, for geometry and scale
     - string      # length prefixed utf8, no interior null bytes
+    - bytes       # length prefixed raw bytes, padded like string
     - fd          # sent only over scm-rights capable transports
     - object      # existing object id
     - new_id      # id allocated by the client for a fresh object
@@ -235,6 +236,9 @@ interfaces:
     requests:
       - {name: create_shm_pool, opcode: 0, args: [{name: fd, type: fd}, {name: size, type: uint32}, {name: id, type: new_id, interface: x12_shm_pool}]}
       # single plane for now, multi plane waits for the dmabuf feedback design decision
+      # server side pixels for the transports without file descriptors,
+      # the client uploads into the pool with x12_shm_pool.write
+      - {name: create_net_pool, opcode: 2, args: [{name: size, type: uint32}, {name: id, type: new_id, interface: x12_shm_pool}]}
       - {name: import_dmabuf, opcode: 1, args: [{name: fd, type: fd}, {name: width, type: uint32}, {name: height, type: uint32}, {name: format, type: uint32}, {name: modifier, type: uint64}, {name: stride, type: uint32}, {name: id, type: new_id, interface: x12_buffer}]}
     events:
       - {name: format, opcode: 0, args: [{name: fourcc, type: uint32}]}
@@ -246,6 +250,9 @@ interfaces:
     requests:
       - {name: create_buffer, opcode: 0, args: [{name: offset, type: uint32}, {name: width, type: uint32}, {name: height, type: uint32}, {name: stride, type: uint32}, {name: format, type: uint32}, {name: id, type: new_id, interface: x12_buffer}]}
       - {name: destroy, opcode: 1, args: []}
+      # copies bytes into the pool at offset. only net pools take writes,
+      # a shm client edits its own memory locally
+      - {name: write, opcode: 2, args: [{name: offset, type: uint32}, {name: data, type: bytes}]}
 
   - name: x12_buffer
     version: 1

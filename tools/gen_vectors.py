@@ -39,6 +39,9 @@ def sample_args(msg):
             args[name] = arg["_first_symbol"]
         elif t == "string":
             args[name] = arg["_sample_string"]
+        elif t == "bytes":
+            # every byte value class at once: nuls and high bits
+            args[name] = b"\x00\x01\x7f\x80\xfe\xff\x00tail"
         elif t == "array_u32":
             args[name] = list(range(4))
         else:

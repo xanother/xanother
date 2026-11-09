@@ -74,6 +74,11 @@ def _encode_args(iface, msg, args, idl, fds):
             padded = _align4(len(raw))
             chunks.append(struct.pack("<I", len(raw)))
             chunks.append(raw + b"\x00" * (padded - len(raw)))
+        elif atype == "bytes":
+            raw = value if isinstance(value, bytes) else value.encode("latin-1")
+            padded = _align4(len(raw))
+            chunks.append(struct.pack("<I", len(raw)))
+            chunks.append(raw + b"\x00" * (padded - len(raw)))
         elif atype == "array_u32":
             chunks.append(struct.pack("<I", len(value)))
             chunks.extend(struct.pack("<I", v) for v in value)
@@ -181,6 +186,18 @@ def _decode_args(idl, iface, msg, buf, offset):
             if any(buf[offset - (padded - length):offset]):
                 raise WireError("string padding must be zero")
             args[name] = text
+        elif atype == "bytes":
+            _need(buf, offset, 4)
+            (length,) = struct.unpack_from("<I", buf, offset)
+            offset += 4
+            padded = _align4(length)
+            if offset + padded > len(buf):
+                raise WireError("bytes exceed buffer")
+            raw = buf[offset:offset + length]
+            offset += padded
+            if any(buf[offset - (padded - length):offset]):
+                raise WireError("bytes padding must be zero")
+            args[name] = raw
         elif atype == "array_u32":
             _need(buf, offset, 4)
             (count,) = struct.unpack_from("<I", buf, offset)

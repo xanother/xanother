@@ -10,6 +10,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <stdlib.h>
+
 #include "x12_protocol.h"
 #include "frame.h"
 
@@ -53,6 +55,44 @@ int x12_pool_create(struct x12_conn *c, uint32_t id, int fd, uint32_t size) {
     return 0;
 }
 
+int x12_pool_create_net(struct x12_conn *c, uint32_t id, uint32_t size) {
+    if (size == 0) {
+        return X12_ERROR_CODE_BAD_VALUE;
+    }
+    if (c->pool_bytes + size > X12_POOL_LIMIT) {
+        return X12_ERROR_CODE_OUT_OF_MEMORY;
+    }
+    uint8_t *map = malloc(size);
+    if (!map) {
+        return X12_ERROR_CODE_OUT_OF_MEMORY;
+    }
+    if (x12_objects_alloc(&c->objects, id, OBJ_SHM_POOL,
+                          x12_iface_find("x12_shm_pool")) != 0) {
+        free(map);
+        return X12_ERROR_CODE_INVALID_ID;
+    }
+    struct x12_object *o = x12_objects_get(&c->objects, id);
+    o->as.pool.map = map;
+    o->as.pool.size = size;
+    o->as.pool.net = 1;
+    c->pool_bytes += size;
+    return 0;
+}
+
+int x12_pool_write(struct x12_conn *c, uint32_t id, uint32_t offset,
+                   const uint8_t *data, uint32_t len) {
+    struct x12_object *o = x12_objects_get(&c->objects, id);
+    // a shm client owns its memory locally, writes feed net pools only
+    if (!o || o->kind != OBJ_SHM_POOL || !o->as.pool.net) {
+        return X12_ERROR_CODE_BAD_VALUE;
+    }
+    if (offset > o->as.pool.size || len > o->as.pool.size - offset) {
+        return X12_ERROR_CODE_BAD_VALUE;
+    }
+    memcpy(o->as.pool.map + offset, data, len);
+    return 0;
+}
+
 void x12_pool_destroy(struct x12_conn *c, uint32_t id) {
     struct x12_object *o = x12_objects_get(&c->objects, id);
     if (!o || o->kind != OBJ_SHM_POOL) {
@@ -66,7 +106,12 @@ void x12_pool_destroy(struct x12_conn *c, uint32_t id) {
             x12_buffer_destroy(c, bid);
         }
     }
-    munmap(o->as.pool.map, o->as.pool.size);
+    if (o->as.pool.net) {
+        free(o->as.pool.map);
+    }
+    else {
+        munmap(o->as.pool.map, o->as.pool.size);
+    }
     c->pool_bytes -= o->as.pool.size;
     x12_objects_free(&c->objects, id);
 }

@@ -57,6 +57,8 @@ struct x12_bufref {
 struct x12_pool_state {
     uint8_t *map;
     size_t size;
+    // 1 = server side pixels fed by pool writes, freed with free()
+    int net;
     uint32_t owner;  // unused today, kept next to the mapping it describes
 };
 

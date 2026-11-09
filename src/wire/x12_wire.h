@@ -18,6 +18,7 @@ enum x12_arg_type {
     X12_ARG_INT64,
     X12_ARG_FIXED24P8,
     X12_ARG_STRING,
+    X12_ARG_BYTES,
     X12_ARG_FD,
     X12_ARG_OBJECT,
     X12_ARG_NEW_ID,

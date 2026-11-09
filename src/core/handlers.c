@@ -369,6 +369,14 @@ int x12_handle_buffer_manager(struct x12_conn *c, uint32_t object,
         }
         return 0;
     }
+    if (strcmp(msg->name, "create_net_pool") == 0) {
+        int rc = x12_pool_create_net(c, (uint32_t)args[1].u64,
+                                     (uint32_t)args[0].u64);
+        if (rc != 0) {
+            x12_conn_error(c, (uint32_t)rc, object);
+        }
+        return 0;
+    }
     if (strcmp(msg->name, "import_dmabuf") == 0) {
         int fd = -1;
         if (x12_conn_take_fd(c, (uint32_t)args[0].u64, &fd) != 0) {
@@ -403,6 +411,15 @@ int x12_handle_shm_pool(struct x12_conn *c, uint32_t object,
     }
     if (strcmp(msg->name, "destroy") == 0) {
         x12_pool_destroy(c, object);
+        return 0;
+    }
+    if (strcmp(msg->name, "write") == 0) {
+        int rc = x12_pool_write(c, object, (uint32_t)args[0].u64,
+                                (const uint8_t *)args[1].str,
+                                args[1].str_len);
+        if (rc != 0) {
+            x12_conn_error(c, (uint32_t)rc, object);
+        }
         return 0;
     }
     x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);

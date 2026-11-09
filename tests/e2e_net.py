@@ -8,6 +8,7 @@
 
 import os
 import socket
+import struct
 import ssl
 import time
 import subprocess
@@ -25,6 +26,7 @@ from tests import core_client as cc  # noqa: E402
 BUILD = ROOT / "build"
 
 CAP_SEAT, CAP_OUTPUT_INFO, CAP_SCREENCOPY = 1, 2, 3
+XR24 = 0x34325258
 
 
 def free_port():
@@ -35,13 +37,15 @@ def free_port():
     return port
 
 
-def spawn(addr, extra_env=None):
+def spawn(addr, extra_env=None, extra_args=(), size=(640, 400)):
     err = open(BUILD / "net-server.stderr", "wb")
     env = dict(os.environ)
     if extra_env:
         env.update(extra_env)
     proc = subprocess.Popen(
-        [str(BUILD / "x12-server"), addr, "--width", "640", "--height", "400"],
+        [str(BUILD / "x12-server"), addr,
+         "--width", str(size[0]), "--height", str(size[1])]
+        + [str(a) for a in extra_args],
         stdout=subprocess.DEVNULL, stderr=err, env=env)
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
@@ -162,6 +166,90 @@ def fd_refusal(s):
     assert err["args"]["code"] == "bad-value", err
 
 
+def remote_buffer_render(idl, addr):
+    # the full picture over the network: pixels uploaded into a net pool
+    # with pool writes, composited and dumped. this is the path a remote
+    # client draws through, no file descriptor ever changes hands
+    w = h = 16
+    ppm = BUILD / "net-render.ppm"
+    ppm.unlink(missing_ok=True)
+    proc, err = spawn(addr, extra_args=["--ppm", str(ppm)], size=(w, h))
+    try:
+        s = dial(addr, idl)
+        handshake(s)
+        s.request("x12_registry", "bind", 2,
+                  name="x12_compositor", version=2, id=10, instance=0)
+        s.register("x12_compositor", 10)
+        s.request("x12_registry", "bind", 2,
+                  name="x12_buffer_manager", version=1, id=11, instance=0)
+        s.register("x12_buffer_manager", 11)
+        for _ in range(2):
+            s.wait_for("format")
+
+        slot = w * h * 4
+        s.request("x12_buffer_manager", "create_net_pool", 11,
+                  size=slot, id=20)
+        s.register("x12_shm_pool", 20)
+
+        # one solid color chunked across many writes, the chunking
+        # exercises offset bookkeeping in the upload path
+        px = struct.pack("<I", 0xFFCC4422)
+        chunk = px * 64
+        for off in range(0, slot, len(chunk)):
+            s.request("x12_shm_pool", "write", 20, offset=off,
+                      data=chunk[:slot - off])
+
+        s.request("x12_shm_pool", "create_buffer", 20, id=21, offset=0,
+                  width=w, height=h, stride=w * 4, format=XR24)
+        s.register("x12_buffer", 21)
+        s.request("x12_compositor", "create_surface", 10, id=30)
+        s.register("x12_surface", 30)
+        s.request("x12_compositor", "create_toplevel", 10, id=31,
+                  surface=30)
+        s.register("x12_toplevel", 31)
+        while True:
+            ev = s.next_event()
+            if ev["name"] == "configure" and ev["object"] == 31:
+                break
+        s.request("x12_toplevel", "ack_configure", 31,
+                  serial=ev["args"]["serial"])
+        s.request("x12_toplevel", "set_fullscreen", 31, state=1)
+        while True:
+            ev = s.next_event()
+            if ev["name"] == "configure" and ev["object"] == 31:
+                break
+        s.request("x12_toplevel", "ack_configure", 31,
+                  serial=ev["args"]["serial"])
+        s.request("x12_surface", "set_buffer", 30, buffer=21)
+        s.request("x12_surface", "damage", 30, x=0, y=0, width=w, height=h)
+        s.request("x12_surface", "commit", 30)
+
+        deadline = time.monotonic() + 10
+        # ppm is rgb, the xrgb byte order is b,g,r,x
+        want = (0xCC, 0x44, 0x22)
+        while time.monotonic() < deadline:
+            try:
+                data = ppm.read_bytes()
+            except FileNotFoundError:
+                time.sleep(0.02)
+                continue
+            parts = data.split(b"255\n", 1)
+            if len(parts) != 2 or len(parts[1]) != w * h * 3:
+                time.sleep(0.02)
+                continue
+            body = parts[1]
+            o = 3 * (8 * w + 8)
+            if (body[o], body[o + 1], body[o + 2]) == want:
+                s.close()
+                return
+            time.sleep(0.02)
+        raise AssertionError("uploaded pixels never reached the framebuffer")
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+        err.close()
+
+
 def main():
     idl = load_idl(ROOT / "spec" / "x12-core.yaml")
 
@@ -209,8 +297,12 @@ def main():
         proc.wait(timeout=5)
         err.close()
 
+    # remote pixels over the network: the upload path through net pools
+    remote_buffer_render(idl, f"tcp:127.0.0.1:{free_port()}")
+
     print("e2e net: PASS, tcp and tls carry the same session, "
-          "fd passing refuses cleanly on the network transports")
+          "fd passing refuses cleanly on the network transports, "
+          "uploaded pixels reach the framebuffer")
 
 
 if __name__ == "__main__":

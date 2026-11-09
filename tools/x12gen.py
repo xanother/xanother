@@ -14,7 +14,7 @@ import yaml
 
 KNOWN_ARG_TYPES = {
     "uint32", "int32", "uint64", "int64",
-    "fixed24p8", "string", "fd", "object", "new_id", "array_u32", "enum",
+    "fixed24p8", "string", "bytes", "fd", "object", "new_id", "array_u32", "enum",
 }
 
 
@@ -213,6 +213,7 @@ ARG_TYPE_IDS = {
     "uint32": "X12_ARG_UINT32", "int32": "X12_ARG_INT32",
     "uint64": "X12_ARG_UINT64", "int64": "X12_ARG_INT64",
     "fixed24p8": "X12_ARG_FIXED24P8", "string": "X12_ARG_STRING",
+    "bytes": "X12_ARG_BYTES",
     "fd": "X12_ARG_FD", "object": "X12_ARG_OBJECT", "new_id": "X12_ARG_NEW_ID",
     "array_u32": "X12_ARG_ARRAY_U32", "enum": "X12_ARG_ENUM",
 }

@@ -15,6 +15,14 @@
 // maps fd as a pool of size bytes, the fd is consumed on success
 int x12_pool_create(struct x12_conn *c, uint32_t id, int fd, uint32_t size);
 
+// a pool of server side pixels for the transports without file
+// descriptors, the client feeds it through x12_pool_write
+int x12_pool_create_net(struct x12_conn *c, uint32_t id, uint32_t size);
+
+// copies bytes into a net pool at offset, bounds checked
+int x12_pool_write(struct x12_conn *c, uint32_t id, uint32_t offset,
+                   const uint8_t *data, uint32_t len);
+
 // frees the mapping and every buffer carved out of it
 void x12_pool_destroy(struct x12_conn *c, uint32_t id);
 
