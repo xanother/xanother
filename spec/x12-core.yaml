@@ -63,10 +63,16 @@ interfaces:
       - {name: hello, opcode: 0, args: [{name: idl_major, type: uint32}, {name: idl_minor, type: uint32}]}
       - {name: sync, opcode: 1, args: [{name: callback, type: new_id, interface: x12_callback}]}
       - {name: shutdown, opcode: 2, args: []}
+      # reattaches the parked session behind token: its objects, scene
+      # presence and serials survive the disconnect and come back
+      - {name: resume, opcode: 3, args: [{name: token, type: uint64}]}
     events:
       # capabilities gate registry.bind: without a matching cap the bind is refused
       - {name: welcome, opcode: 0, args: [{name: caps, type: array_u32, of: x12_capability}, {name: server_version, type: uint32}]}
       - {name: error, opcode: 1, args: [{name: code, type: enum, of: x12_error_code}, {name: object, type: object}]}
+      # the resume token of this session, issued after welcome and
+      # again after a successful resume
+      - {name: session, opcode: 2, args: [{name: token, type: uint64}]}
 
   - name: x12_callback
     version: 1

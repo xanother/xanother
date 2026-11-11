@@ -72,6 +72,13 @@ static int handle_hello(struct x12_conn *c, uint32_t object, const x12_arg *args
                        X12_OBJ_ID_CONNECTION, w, 2) != 0) {
         return -1;
     }
+    // the token keeps this session findable after a disconnect
+    uint64_t token = x12_conn_mint_session(c);
+    x12_arg st[1] = { { .u64 = token } };
+    if (x12_conn_event(c, x12_iface_find("x12_connection"), "session",
+                       X12_OBJ_ID_CONNECTION, st, 1) != 0) {
+        return -1;
+    }
     // the client learns the global set from registry.global events, one
     // per advertised instance
     for (size_t i = 0; i < sizeof bind_rules / sizeof bind_rules[0]; i++) {
@@ -137,6 +144,22 @@ int x12_handle_connection(struct x12_conn *c, uint32_t object,
     }
     if (strcmp(msg->name, "shutdown") == 0) {
         x12_conn_kill(c, "client shutdown");
+        return -1;
+    }
+    if (strcmp(msg->name, "resume") == 0) {
+        struct x12_conn *p = x12_conn_resume(c, args[0].u64);
+        if (!p) {
+            x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
+            return 0;
+        }
+        // the parked session took this transport over, its token comes
+        // back so the client knows which one to keep. the rest of the
+        // batch follows into the session, this conn is done
+        uint64_t token = p->resume_token;
+        x12_arg st[1] = { { .u64 = token } };
+        x12_conn_event(p, x12_iface_find("x12_connection"), "session",
+                       X12_OBJ_ID_CONNECTION, st, 1);
+        x12_conn_kill(c, "session resumed");
         return -1;
     }
     x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);

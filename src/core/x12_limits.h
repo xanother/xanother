@@ -20,3 +20,7 @@
 #define X12_OBJ_ID_REGISTRY 2u
 
 #endif
+
+// how long a disconnected session survives before its objects and
+// scene presence are torn down, the resume window
+#define X12_SESSION_TTL_NS (30ull * 1000000000ull)

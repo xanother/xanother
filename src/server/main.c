@@ -113,6 +113,9 @@ static void sync_outputs(struct x12_conn *conns, size_t n) {
     x12_comp_full_damage();
 }
 
+// the resume window, tests shrink it through the environment
+static uint64_t session_ttl_ns = X12_SESSION_TTL_NS;
+
 int main(int argc, char **argv) {
     const char *sock_path = argc > 1 ? argv[1] : "/tmp/x12.sock";
     struct sigaction sa;
@@ -223,6 +226,12 @@ int main(int argc, char **argv) {
     fprintf(stderr, "x12-server: listening on %s, canvas %ux%u\n",
             sock_path, canvas_w, canvas_h);
 
+    {
+        const char *ttl = getenv("X12_SESSION_TTL_MS");
+        if (ttl && atoi(ttl) > 0) {
+            session_ttl_ns = (uint64_t)atoi(ttl) * 1000000ull;
+        }
+    }
     struct x12_conn conns[X12_MAX_CLIENTS];
     for (size_t i = 0; i < X12_MAX_CLIENTS; i++) {
         conns[i].fd = -1;
@@ -270,7 +279,7 @@ int main(int argc, char **argv) {
             if (fd >= 0) {
                 size_t i;
                 for (i = 0; i < X12_MAX_CLIENTS; i++) {
-                    if (conns[i].fd < 0) {
+                    if (conns[i].fd < 0 && !conns[i].parked) {
                         break;
                     }
                 }
@@ -302,18 +311,35 @@ int main(int argc, char **argv) {
                 if (pfd[k].revents & POLLOUT) {
                     x12_conn_flush(c);
                 }
+                // a resume moved a half dispatched batch over, it reads
+                // as already arrived input
+                if (c->in_len >= X12_HEADER_SIZE) {
+                    x12_conn_pump(c, x12_dispatch);
+                }
             }
             if (c->dead) {
                 // the final error events go out before the fd goes away,
                 // a loud disconnect names its reason
                 x12_conn_flush(c);
-                client_teardown(c);
+                // a session survives its transport: the objects and the
+                // scene presence wait behind the resume token
+                if (!x12_conn_park(c, session_ttl_ns)) {
+                    client_teardown(c);
+                }
+                else {
+                    // the transport is gone: a parked client cannot
+                    // serve a selection transfer, but its windows and
+                    // scene presence wait for the resume
+                    x12_selection_release_owner(c);
+                }
                 x12_net_tls_free(c->tls);
                 c->tls = 0;
                 close(c->fd);
                 c->fd = -1;
             }
         }
+        // the resume window of disconnected sessions runs out here
+        x12_conn_parked_sweep((uint64_t)x12_now_ns(), client_teardown);
         // drain whatever queued while handlers were answering, and let
         // fences that signaled between passes retire their frames
         for (size_t i = 0; i < X12_MAX_CLIENTS; i++) {
@@ -325,11 +351,22 @@ int main(int argc, char **argv) {
             }
             if (conns[i].dead && conns[i].fd >= 0) {
                 x12_conn_flush(&conns[i]);
-                client_teardown(&conns[i]);
+                if (!x12_conn_park(&conns[i], session_ttl_ns)) {
+                    client_teardown(&conns[i]);
+                }
+                else {
+                    x12_selection_release_owner(&conns[i]);
+                }
                 x12_net_tls_free(conns[i].tls);
                 conns[i].tls = 0;
                 close(conns[i].fd);
                 conns[i].fd = -1;
+            }
+            if (conns[i].dead && conns[i].fd < 0 && !conns[i].parked) {
+                // the transport went to a resumed session, whatever the
+                // fresh conn owned goes now
+                client_teardown(&conns[i]);
+                conns[i].dead = 0;
             }
         }
         // sources pump what arrived this round, the router turns it into

@@ -4,6 +4,7 @@
 #include "conn.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -47,6 +48,110 @@ void x12_conn_kill(struct x12_conn *c, const char *why) {
     c->netbuf_len = 0;
     fprintf(stderr, "x12-server: disconnecting client fd %d, %s\n",
             c->fd, why);
+}
+
+// parked sessions, slots in the conns array that lost their transport
+// but kept their identity. the scene keys clients by pointer so a
+// parked session never moves
+static struct x12_conn *parked[X12_MAX_CLIENTS];
+static size_t n_parked;
+// set by resume while a batch is mid dispatch, the pump moves the
+// remainder of the batch to the session that took the transport over
+static struct x12_conn *resume_target;
+
+uint64_t x12_conn_mint_session(struct x12_conn *c) {
+    // the token names the session across reconnects, it only has to be
+    // unguessable inside the resume window
+    uint64_t token = 0;
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        if (read(fd, &token, sizeof token) != (ssize_t)sizeof token) {
+            token = 0;
+        }
+        close(fd);
+    }
+    if (token == 0) {
+        token = (uint64_t)x12_now_ns() ^ ((uint64_t)(uintptr_t)c << 32);
+    }
+    // zero is the "no session" marker, never hand it out
+    if (token == 0) {
+        token = 1;
+    }
+    c->resume_token = token;
+    return token;
+}
+
+int x12_conn_park(struct x12_conn *c, uint64_t ttl_ns) {
+    if (c->resume_token == 0 || n_parked >= X12_MAX_CLIENTS) {
+        return 0;
+    }
+    // whatever the transport had not finished dies with it, the client
+    // rebuilds its state on resume
+    c->in_len = 0;
+    c->out_len = 0;
+    c->n_in_fds = 0;
+    c->n_out_fds = 0;
+    c->parked = 1;
+    c->park_deadline = x12_now_ns() + ttl_ns;
+    parked[n_parked++] = c;
+    return 1;
+}
+
+struct x12_conn *x12_conn_resume(struct x12_conn *fresh, uint64_t token) {
+    if (token == 0) {
+        return 0;
+    }
+    for (size_t i = 0; i < n_parked; i++) {
+        struct x12_conn *p = parked[i];
+        if (p->resume_token != token) {
+            continue;
+        }
+        // the transport moves into the parked slot and the fresh conn
+        // closes: the scene keeps pointing at the session it knows. the
+        // out queue moves too, the events hello already earned are
+        // owed to the client on the other side of this fd
+        p->fd = fresh->fd;
+        p->tls = fresh->tls;
+        p->net = fresh->net;
+        p->netbuf = fresh->netbuf;
+        p->netbuf_len = fresh->netbuf_len;
+        memcpy(p->out, fresh->out, fresh->out_len);
+        p->out_len = fresh->out_len;
+        memcpy(p->out_fds, fresh->out_fds,
+               fresh->n_out_fds * sizeof fresh->out_fds[0]);
+        p->n_out_fds = fresh->n_out_fds;
+        p->out_fds_sent = fresh->out_fds_sent;
+        p->parked = 0;
+        p->dead = 0;
+        // the fresh conn owns nothing any more, the pump moves the rest
+        // of its input batch over before it goes
+        fresh->fd = -1;
+        fresh->tls = 0;
+        fresh->netbuf = 0;
+        fresh->netbuf_len = 0;
+        fresh->out_len = 0;
+        fresh->n_out_fds = 0;
+        parked[i] = parked[--n_parked];
+        resume_target = p;
+        return p;
+    }
+    return 0;
+}
+
+void x12_conn_parked_sweep(uint64_t now,
+                           void (*teardown)(struct x12_conn *)) {
+    for (size_t i = 0; i < n_parked; i++) {
+        struct x12_conn *p = parked[i];
+        if (now < p->park_deadline) {
+            continue;
+        }
+        // the resume window closed, the session goes away for good
+        parked[i] = parked[--n_parked];
+        i--;
+        p->parked = 0;
+        teardown(p);
+        p->dead = 0;
+    }
 }
 
 uint32_t x12_conn_next_serial(struct x12_conn *c) {
@@ -94,6 +199,11 @@ int x12_conn_event_ts(struct x12_conn *c, const x12_iface_desc *iface,
                       const x12_arg *args, size_t nargs, uint64_t ts) {
     if (c->dead) {
         return -1;
+    }
+    if (c->parked) {
+        // nobody is listening, a queued event would only fill the out
+        // buffer and kill the parked session later
+        return 0;
     }
     const x12_msg_desc *msg = x12_msg_find_name(iface, X12_EVENT, evt);
     if (!msg) {
@@ -300,6 +410,12 @@ int x12_conn_read(struct x12_conn *c,
             }
         }
     }
+    return x12_conn_pump(c, on_frame);
+}
+
+int x12_conn_pump(struct x12_conn *c,
+                  int (*on_frame)(struct x12_conn *, const uint8_t *,
+                                  size_t)) {
     size_t off = 0;
     while (c->in_len - off >= X12_HEADER_SIZE) {
         const uint8_t *frame = c->in + off;
@@ -320,6 +436,17 @@ int x12_conn_read(struct x12_conn *c,
             return -1;
         }
         off += size;
+        // a resume moved the transport elsewhere mid batch: the rest of
+        // the batch belongs to that session now
+        if (resume_target) {
+            struct x12_conn *p = resume_target;
+            resume_target = 0;
+            size_t rest = c->in_len - off;
+            memcpy(p->in + p->in_len, c->in + off, rest);
+            p->in_len += rest;
+            c->in_len = 0;
+            return 0;
+        }
     }
     memmove(c->in, c->in + off, c->in_len - off);
     c->in_len -= off;

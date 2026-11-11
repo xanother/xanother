@@ -54,10 +54,40 @@ struct x12_conn {
     // the client stopped reading, the server disconnects it loudly
     // instead of silently dropping events. the main loop reaps dead ones
     int dead;
+    // resume session: every hello mints a token, a disconnected client
+    // holding one finds its objects and scene presence waiting. while
+    // parked the slot keeps its address - the scene keys clients by
+    // pointer - and events are dropped, the client rebuilds on resume
+    int parked;
+    uint64_t resume_token;
+    uint64_t park_deadline;
     struct x12_objects objects;
 };
 
 void x12_conn_init(struct x12_conn *c, int fd);
+
+// mints the resume token of this session and returns it
+uint64_t x12_conn_mint_session(struct x12_conn *c);
+
+// parks the connection for ttl_ns: the slot, its objects and its scene
+// presence survive with the transport gone. returns 0 when there is no
+// session to park
+int x12_conn_park(struct x12_conn *c, uint64_t ttl_ns);
+
+// moves the fresh connection's transport into the parked session
+// behind token and hands the parked conn back. NULL when the token is
+// unknown, the fresh conn keeps living as its own session then
+struct x12_conn *x12_conn_resume(struct x12_conn *fresh, uint64_t token);
+
+// hands every parked session past its deadline to teardown
+void x12_conn_parked_sweep(uint64_t now,
+                           void (*teardown)(struct x12_conn *));
+
+// runs every complete frame already buffered, for input that arrived
+// with a transport move instead of a read
+int x12_conn_pump(struct x12_conn *c,
+                  int (*on_frame)(struct x12_conn *, const uint8_t *,
+                                  size_t));
 
 // reads bytes and hands every complete frame to on_frame, partial frames
 // wait for more, framing violations die loudly. returns -1 once dead
