@@ -6,6 +6,7 @@
 #include "backend.h"
 #include "output.h"
 
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -584,6 +585,8 @@ static int make_keymap_fd(uint32_t *size_out) {
             }
         }
     }
+    // xkb hands the text over as a fresh allocation
+    free((void *)text);
     xkb_keymap_unref(km);
     xkb_context_unref(ctx);
     return fd;
