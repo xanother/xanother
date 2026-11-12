@@ -306,12 +306,16 @@ void x12_conn_flush(struct x12_conn *c) {
             cm->cmsg_len = CMSG_LEN(sizeof(int) * c->n_out_fds);
             memcpy(CMSG_DATA(cm), c->out_fds, sizeof(int) * c->n_out_fds);
             n = sendmsg(c->fd, &msg, MSG_NOSIGNAL);
-            // the fds ride with the first bytes regardless of how much of
-            // the payload made it, the kernel holds its own references
-            for (size_t i = 0; i < c->n_out_fds; i++) {
-                close(c->out_fds[i]);
+            if (n > 0) {
+                // the fds ride with the first bytes regardless of how
+                // much of the payload made it, the kernel holds its own
+                // references now. nothing was sent on a stall, so the
+                // descriptors wait with the bytes for the next pass
+                for (size_t i = 0; i < c->n_out_fds; i++) {
+                    close(c->out_fds[i]);
+                }
+                c->n_out_fds = 0;
             }
-            c->n_out_fds = 0;
         } else {
             n = x12_net_write(NULL, c->fd, c->out + off, c->out_len - off);
         }
