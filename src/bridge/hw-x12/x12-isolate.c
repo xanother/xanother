@@ -710,7 +710,7 @@ iso_change_window_attributes(ClientPtr client)
     CARD32 evmask = 0;
     WindowPtr pWin;
     Mask forbidden;
-    int rc, claim = 0, drop = 0;
+    int rc, claim = 0;
     unsigned int bit;
 
     REQUEST(xChangeWindowAttributesReq);
@@ -750,9 +750,6 @@ iso_change_window_attributes(ClientPtr client)
         if (evmask & SubstructureRedirectMask) {
             claim = 1;
         }
-        else {
-            drop = 1;
-        }
     }
 
     if (!claim && !iso_view_all(client)) {
@@ -774,15 +771,15 @@ iso_change_window_attributes(ClientPtr client)
     }
 
     struct iso_client *ic = iso_client(client);
-    if (ic) {
-        if (claim) {
-            // the redirect holder is the manager, dix already
-            // guaranteed the hold is exclusive
-            ic->grant_mgr = 1;
-        }
-        else if (drop && ic->grant_mgr) {
-            ic->grant_mgr = 0;
-        }
+    if (ic && claim) {
+        // the redirect holder is the manager, dix already guaranteed
+        // the hold is exclusive. the grant sticks to the connection:
+        // toolkits reshuffle the root mask behind the wm's back (gdk
+        // re selects a plain key and property mask after the claim)
+        // and a demotion on that would hand the wm a cloaked view of
+        // its own desktop. the claimer already saw the whole tree the
+        // moment it took the seat, sticking reveals nothing new
+        ic->grant_mgr = 1;
     }
     return Success;
 }
