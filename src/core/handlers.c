@@ -615,8 +615,13 @@ static void announce_keyboard(struct x12_conn *c, uint32_t kb_id) {
 static void surface_logical(const struct x12_surface_state *s, uint32_t *w,
                             uint32_t *h) {
     uint32_t sc = s->current_scale ? s->current_scale : 256;
-    *w = (s->current.width * 256u + sc / 2) / sc;
-    *h = (s->current.height * 256u + sc / 2) / sc;
+    // widened first: a hostile buffer size times the scale fraction
+    // wrapped the 32 bit math and produced garbage geometry. the result
+    // is clamped to a size no screen could ever need
+    uint64_t lw = ((uint64_t)s->current.width * 256u + sc / 2) / sc;
+    uint64_t lh = ((uint64_t)s->current.height * 256u + sc / 2) / sc;
+    *w = lw > (1u << 24) ? (1u << 24) : (uint32_t)lw;
+    *h = lh > (1u << 24) ? (1u << 24) : (uint32_t)lh;
 }
 
 // the screen a fullscreen window takes: a fresh map lands on the
