@@ -143,7 +143,7 @@ def main():
         assert ri["args"] == {"rate": 25, "delay": 600}, ri
 
         # windows: red at cascade 32,32 and green at 56,56
-        pool_fd = os.memfd_create("x12-pool")
+        pool_fd = os.memfd_create("x12-pool", os.MFD_ALLOW_SEALING)
         os.ftruncate(pool_fd, 4 * SLOT)
         s.request("x12_buffer_manager", "create_shm_pool", 11,
                   fds=[pool_fd], fd=0, size=4 * SLOT, id=20)

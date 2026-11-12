@@ -36,7 +36,7 @@ def bind(s, name, version, id):
 
 
 def make_pool(s, size, id):
-    memfd = os.memfd_create("x12-pool")
+    memfd = os.memfd_create("x12-pool", os.MFD_ALLOW_SEALING)
     os.ftruncate(memfd, size)
     s.request("x12_buffer_manager", "create_shm_pool", 11,
               fds=[memfd], fd=0, size=size, id=id)

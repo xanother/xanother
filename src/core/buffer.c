@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <fcntl.h>
 #include <stdlib.h>
 
 #include "x12_protocol.h"
@@ -35,6 +36,14 @@ int x12_pool_create(struct x12_conn *c, uint32_t id, int fd, uint32_t size) {
     }
     struct stat st;
     if (fstat(fd, &st) != 0 || (uint64_t)st.st_size < size) {
+        close(fd);
+        return X12_ERROR_CODE_BAD_VALUE;
+    }
+    // a pool the client can still truncate is a crash waiting to
+    // happen: shrink the file under the mapping and the compositor
+    // takes a sigbus reading pixels. sealed memfds cannot do that,
+    // everything else is refused
+    if (fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW) != 0) {
         close(fd);
         return X12_ERROR_CODE_BAD_VALUE;
     }

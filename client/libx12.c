@@ -571,7 +571,8 @@ int x12c_dispatch(struct x12c *c, int timeout_ms) {
 
 int x12c_pool_create(x12c *c, uint32_t bufman_id, size_t size,
                      uint32_t *id_out, void *user) {
-    int memfd = (int)syscall(SYS_memfd_create, "x12c-pool", MFD_CLOEXEC);
+    int memfd = (int)syscall(SYS_memfd_create, "x12c-pool",
+                            MFD_CLOEXEC | MFD_ALLOW_SEALING);
     if (memfd < 0 || ftruncate(memfd, (off_t)size) != 0) {
         if (memfd >= 0) {
             close(memfd);

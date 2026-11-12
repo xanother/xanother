@@ -229,7 +229,7 @@ def main():
         stage("presents follow the screen that carried the pixels")
         # a window cascades near the origin, its frames present only on
         # the output whose rect shows them
-        make_window(s, 20, 22, 21, 200, 150, memfd=os.memfd_create("w"))
+        make_window(s, 20, 22, 21, 200, 150, memfd=os.memfd_create("w", os.MFD_ALLOW_SEALING))
         map_toplevel(s, 20, 23)
         commit_twice(s, 20)
         pr = wait_ev(s, "present", 3)
@@ -240,7 +240,7 @@ def main():
         # a popup pinned past the first head shows on the second one.
         # the popup centers on anchor center plus the offset, so the
         # offset aims its middle at the right head
-        make_window(s, 24, 26, 25, 100, 100, memfd=os.memfd_create("p"))
+        make_window(s, 24, 26, 25, 100, 100, memfd=os.memfd_create("p", os.MFD_ALLOW_SEALING))
         s.request("x12_compositor", "create_positioner", 10, id=28)
         s.register("x12_positioner", 28)
         s.request("x12_positioner", "set_anchor_rect", 28,

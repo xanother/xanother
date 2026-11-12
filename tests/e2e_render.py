@@ -132,7 +132,7 @@ def main():
             s.wait_for("format")
 
         # one pool, five slots of pixels
-        pool_fd = os.memfd_create("x12-pool")
+        pool_fd = os.memfd_create("x12-pool", os.MFD_ALLOW_SEALING)
         os.ftruncate(pool_fd, 5 * SLOT)
         s.request("x12_buffer_manager", "create_shm_pool", 11,
                   fds=[pool_fd], fd=0, size=5 * SLOT, id=20)

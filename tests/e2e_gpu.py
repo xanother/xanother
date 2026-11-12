@@ -101,7 +101,7 @@ def run_scene(sock, ppm, extra_args):
             s.wait_for("format")
 
         # the fullscreen window carries the opaque pattern
-        pool_fd = os.memfd_create("x12-pool")
+        pool_fd = os.memfd_create("x12-pool", os.MFD_ALLOW_SEALING)
         os.ftruncate(pool_fd, 4 * W * H * 4)
         s.request("x12_buffer_manager", "create_shm_pool", 11,
                   fds=[pool_fd], fd=0, size=4 * W * H * 4, id=20)

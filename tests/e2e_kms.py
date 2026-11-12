@@ -73,7 +73,7 @@ def main():
         bind(s, "x12_buffer_manager", 1, 12)
         s.request("x12_compositor", "create_surface", 10, id=11)
         s.register("x12_surface", 11)
-        memfd = os.memfd_create("x12-kms")
+        memfd = os.memfd_create("x12-kms", os.MFD_ALLOW_SEALING)
         os.ftruncate(memfd, 64 * 64 * 4)
         os.lseek(memfd, 0, 0)
         os.write(memfd, b"\x44\x33\x22\xff" * (64 * 64))

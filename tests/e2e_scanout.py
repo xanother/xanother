@@ -160,7 +160,7 @@ def main():
         bind(s, "x12_buffer_manager", 1, 12)
 
         stage("a fake dmabuf is refused loudly")
-        fake = os.memfd_create("x12-not-a-dmabuf")
+        fake = os.memfd_create("x12-not-a-dmabuf", os.MFD_ALLOW_SEALING)
         os.ftruncate(fake, 64 * 64 * 4)
         s.request("x12_buffer_manager", "import_dmabuf", 12, fds=[fake],
                   fd=0, width=64, height=64, format=XR24, modifier=0,
