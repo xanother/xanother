@@ -672,15 +672,20 @@ iso_send_event(ClientPtr client)
     REQUEST_SIZE_MATCH(xSendEventReq);
     etype = *(CARD8 *)&stuff->event;
 
+    // a client message is the ewmh request path and travels for
+    // everyone: the destination checks below police synthetic input
+    // only. the order matters - a message aimed at the pointer or the
+    // focus window is the normal ewmh way and must not look like a
+    // synthetic input attempt
+    if (etype == ClientMessage) {
+        return ProcSendEvent(client);
+    }
+
     if (stuff->destination == PointerWindow ||
         stuff->destination == InputFocus) {
         // targeting whatever holds the pointer or the focus is a
         // manager channel
         return iso_view_all(client) ? ProcSendEvent(client) : BadAccess;
-    }
-
-    if (etype == ClientMessage) {
-        return ProcSendEvent(client);
     }
 
     w = stuff->destination;
