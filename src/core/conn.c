@@ -368,6 +368,11 @@ int x12_conn_read(struct x12_conn *c,
         c->in + c->in_len,
         X12_IO_BUF - c->in_len,
     };
+    // a zero length read reports eof, never ask for one
+    if (iov.iov_len == 0) {
+        x12_conn_kill(c, "input buffer full");
+        return -1;
+    }
     if (c->tls || c->net) {
         // no scm rights on the network transports
         memset(&mh, 0, sizeof mh);
