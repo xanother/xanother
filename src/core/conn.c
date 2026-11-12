@@ -244,6 +244,12 @@ int x12_conn_event_ts(struct x12_conn *c, const x12_iface_desc *iface,
 int x12_conn_event_fd(struct x12_conn *c, const x12_iface_desc *iface,
                       const char *evt, uint32_t object, x12_arg *args,
                       size_t nargs, size_t fd_arg_index, int fd) {
+    if (c->dead || c->parked) {
+        // the event itself would be dropped the same way, the
+        // descriptor must not queue up behind it
+        close(fd);
+        return -1;
+    }
     if (c->n_out_fds >= X12_MAX_FDS) {
         close(fd);
         return -1;
