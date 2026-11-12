@@ -724,14 +724,25 @@ iso_change_window_attributes(ClientPtr client)
         return orig_change_window_attributes(client);
     }
 
-    // walk the value list to the event mask slot
+    // the value list holds one card32 per set bit of the mask in bit
+    // order, the event mask lives at its own bit (0x800). the mask
+    // constants are bit values and not list indexes - walking them as
+    // indexes missed the slot every time and no client ever became
+    // the manager
     values = (CARD32 *)(req + 1);
-    for (bit = 0; bit < (unsigned)CWCursor; bit++) {
+    unsigned int maxv =
+        (client->req_len * 4 - sizeof(xChangeWindowAttributesReq)) / 4;
+    unsigned int seen = 0;
+    for (bit = 0; bit < 15; bit++) {
         if (req->valueMask & (1u << bit)) {
-            if (bit + 1 == (unsigned)CWEventMask) {
+            if (seen >= maxv) {
+                break;
+            }
+            if ((1u << bit) == CWEventMask) {
                 evmask = *values;
             }
             values++;
+            seen++;
         }
     }
 
