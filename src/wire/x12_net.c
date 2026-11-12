@@ -21,6 +21,10 @@
 #include <zlib.h>
 #include <openssl/ssl.h>
 
+// the kernel truncates silently at its own limit, so parsing has to
+// refuse anything that would not survive the bind round trip
+enum { X12_SUN_PATH_MAX = sizeof(((struct sockaddr_un *)0)->sun_path) };
+
 static int
 parse_hostport(const char *s, struct x12_net_addr *out)
 {
@@ -52,8 +56,14 @@ x12_net_parse(const char *spec, struct x12_net_addr *out)
     }
     if (strncmp(spec, "unix:", 5) == 0) {
         out->kind = X12_NET_UNIX;
+        // a path that does not fit the kernel limit would bind to its
+        // own truncation while the unlink used the full name: two
+        // addresses would collide into one socket
+        if (!spec[5] || strlen(spec + 5) >= (size_t)X12_SUN_PATH_MAX) {
+            return -1;
+        }
         snprintf(out->path, sizeof(out->path), "%s", spec + 5);
-        return out->path[0] ? 0 : -1;
+        return 0;
     }
     if (strncmp(spec, "tcp:", 4) == 0) {
         out->kind = X12_NET_TCP;
@@ -65,6 +75,9 @@ x12_net_parse(const char *spec, struct x12_net_addr *out)
     }
     // a bare path stays unix, the positional socket argument of old
     out->kind = X12_NET_UNIX;
+    if (strlen(spec) >= (size_t)X12_SUN_PATH_MAX) {
+        return -1;
+    }
     snprintf(out->path, sizeof(out->path), "%s", spec);
     return 0;
 }
