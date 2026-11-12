@@ -40,10 +40,13 @@ parse_hostport(const char *s, struct x12_net_addr *out)
     }
     memcpy(out->host, s, hlen);
     out->host[hlen] = 0;
-    out->port = atoi(colon + 1);
-    if (out->port <= 0 || out->port > 65535) {
+    // atoi would swallow trailing garbage like 80abc
+    char *end;
+    long port = strtol(colon + 1, &end, 10);
+    if (*end != 0 || port <= 0 || port > 65535) {
         return -1;
     }
+    out->port = (int)port;
     return 0;
 }
 
