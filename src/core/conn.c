@@ -432,12 +432,11 @@ int x12_conn_pump(struct x12_conn *c,
         if (size > c->in_len - off) {
             break;
         }
-        if (on_frame(c, frame, size) != 0) {
-            return -1;
-        }
+        int rc = on_frame(c, frame, size);
         off += size;
         // a resume moved the transport elsewhere mid batch: the rest of
-        // the batch belongs to that session now
+        // the batch belongs to that session now. this runs even when the
+        // handler returned -1, the resume handler always does
         if (resume_target) {
             struct x12_conn *p = resume_target;
             resume_target = 0;
@@ -446,6 +445,9 @@ int x12_conn_pump(struct x12_conn *c,
             p->in_len += rest;
             c->in_len = 0;
             return 0;
+        }
+        if (rc != 0) {
+            return -1;
         }
     }
     memmove(c->in, c->in + off, c->in_len - off);
