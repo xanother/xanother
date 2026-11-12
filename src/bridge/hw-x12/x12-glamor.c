@@ -643,13 +643,12 @@ x12_glamor_target_blit(ScreenPtr pScreen, RegionPtr rgn)
     BoxPtr boxes = RegionRects(rgn);
     int n = RegionNumRects(rgn);
     for (int i = 0; i < n; i++) {
-        // glamor renders the dix top row into the gl last row, so the
-        // source rect mirrors the dix damage box into gl space while
-        // the target fbo rows read top down like the scanout: dix row
-        // r lives in the target row r, the flip lives in the source
-        int sy1 = h - boxes[i].y1;
-        int sy0 = h - boxes[i].y2;
-        glBlitFramebuffer(boxes[i].x1, sy0, boxes[i].x2, sy1,
+        // glamor keeps pixmap row zero at gl row zero and the scanout
+        // target reads its linear memory top down the same way, so the
+        // damage box copies straight across. the source flip that used
+        // to live here mirrored every box into empty rows and the frame
+        // stayed black
+        glBlitFramebuffer(boxes[i].x1, boxes[i].y1, boxes[i].x2, boxes[i].y2,
                           boxes[i].x1, boxes[i].y1,
                           boxes[i].x2, boxes[i].y2,
                           GL_COLOR_BUFFER_BIT, GL_NEAREST);
@@ -659,9 +658,10 @@ x12_glamor_target_blit(ScreenPtr pScreen, RegionPtr rgn)
 }
 
 // reads a rectangle of the screen texture into a caller buffer of
-// w*h*4 bgrx rows in dix top down order; the gl readback rows come
-// bottom up, so the copy flips them; answers zero when the pixmap is
-// not a glamor texture and the caller falls back
+// w*h*4 bgrx rows in dix order; glamor stores pixmap row zero at gl
+// row zero so the rows come back in order and no flip is needed;
+// answers zero when the pixmap is not a glamor texture and the caller
+// falls back
 int
 x12_glamor_read_texture(PixmapPtr pix, int x, int y, int w, int h,
                         unsigned char *out)
@@ -682,22 +682,9 @@ x12_glamor_read_texture(PixmapPtr pix, int x, int y, int w, int h,
         glDeleteFramebuffers(1, &fbo);
         return 0;
     }
-    int pw = pix->drawable.width;
-    int ph = pix->drawable.height;
-    unsigned char *rows = malloc((size_t) w * h * 4);
-    if (!rows) {
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        glDeleteFramebuffers(1, &fbo);
-        return 0;
-    }
-    glReadPixels(x, ph - y - h, w, h, GL_BGRA, GL_UNSIGNED_BYTE, rows);
+    glReadPixels(x, y, w, h, GL_BGRA, GL_UNSIGNED_BYTE, out);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glDeleteFramebuffers(1, &fbo);
-    // bottom up gl rows arrive, write them top down into the buffer
-    for (int r = 0; r < h; r++) {
-        memcpy(out + (size_t) r * w * 4,
-               rows + (size_t) (h - 1 - r) * w * 4, (size_t) w * 4);
-    }
-    free(rows);
     return 1;
 }
+

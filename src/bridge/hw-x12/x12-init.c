@@ -526,10 +526,10 @@ x12_pump_pixmap(ScreenPtr pScreen, PixmapPtr pix, RegionPtr rgn)
     int n = RegionNumRects(rgn);
     BoxPtr boxes = RegionRects(rgn);
     if (x12_bridge_dmabuf_active()) {
-        // the screen renders into a glamor texture whose gl row order
-        // is bottom up, the scanout reads top down: the pump flips the
-        // damaged boxes into the linear scanout buffer on the gpu, one
-        // blit per box, no row ever crosses the wire
+        // the screen renders into a glamor texture, the scanout reads
+        // the linear target top down: the pump blits the damaged boxes
+        // into it on the gpu, one blit per box, no row ever crosses
+        // the wire
         x12_glamor_target_blit(pScreen, rgn);
         x12_glamor_finish();
         // the filled buffer goes on the surface, the commit inside the
