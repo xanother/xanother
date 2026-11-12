@@ -66,7 +66,7 @@ static DestroyPixmapProcPtr saved_destroy_pixmap;
 
 static EGLImageKHR
 x12Dri3ImageFromDmabuf(CARD8 depth, int fd, uint32_t w, uint32_t h,
-                       uint32_t stride, uint64_t modifier)
+                       uint32_t stride, uint32_t offset, uint64_t modifier)
 {
     EGLint attrs[] = {
         EGL_WIDTH, (EGLint) w,
@@ -74,7 +74,7 @@ x12Dri3ImageFromDmabuf(CARD8 depth, int fd, uint32_t w, uint32_t h,
         EGL_LINUX_DRM_FOURCC_EXT,
         (EGLint) (depth == 32 ? X12_DRI3_FOURCC_AR24 : X12_DRI3_FOURCC_XR24),
         EGL_DMA_BUF_PLANE0_FD_EXT, fd,
-        EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, (EGLint) offset,
         EGL_DMA_BUF_PLANE0_PITCH_EXT, (EGLint) stride,
         EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (EGLint) (modifier & 0xffffffffull),
         EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (EGLint) (modifier >> 32),
@@ -116,18 +116,26 @@ x12Dri3PixmapFromFds(ScreenPtr screen, CARD8 num_fds, const int *fds,
                      CARD64 modifier)
 {
     if (!dri3_active || num_fds != 1 ||
-        (depth != 24 && depth != 32) || width == 0 || height == 0) {
+        (depth != 24 && depth != 32) || width == 0 || height == 0 ||
+        bpp != BitsPerPixel(depth) ||
+        strides[0] < width * (CARD32)bpp / 8) {
         return NULL;
     }
     struct glamor_screen_private *glamor_priv =
         glamor_get_screen_private(screen);
-    PixmapPtr pixmap = screen->CreatePixmap(screen, 0, 0, depth, 0);
+    // the pixmap carries the real client geometry: the fbo the
+    // texture attaches to sizes itself from the pixmap header and the
+    // zero sized header every present copy used to run against turned
+    // a whole client frame into a no op
+    PixmapPtr pixmap = glamor_create_pixmap(screen, width, height, depth,
+                                            GLAMOR_CREATE_PIXMAP_NO_TEXTURE);
     if (!pixmap) {
         return NULL;
     }
     x12_glamor_make_current();
     EGLImageKHR image = x12Dri3ImageFromDmabuf(depth, fds[0], width,
                                                height, strides[0],
+                                               offsets[0],
                                                (uint64_t) modifier);
     if (image == EGL_NO_IMAGE_KHR) {
         screen->DestroyPixmap(pixmap);
