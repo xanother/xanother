@@ -145,7 +145,9 @@ static int arg_size(const x12_arg_desc *ad, const x12_arg *a, size_t *out) {
     case X12_ARG_FD:
     case X12_ARG_OBJECT:
     case X12_ARG_NEW_ID:
-        if (ad->type == X12_ARG_ENUM && a->u64 >= x12_enums[ad->enum_id].symbol_count) {
+        if (ad->type == X12_ARG_ENUM &&
+            (ad->enum_id >= x12_enums_count ||
+             a->u64 >= x12_enums[ad->enum_id].symbol_count)) {
             return X12_ERR_ARG;
         }
         *out = 4;
@@ -322,8 +324,10 @@ int x12_decode(const x12_iface_desc *iface, const x12_msg_desc *msg,
             }
             uint32_t v = rd_u32(off - 4);
             // enum values outside the declared range are wire garbage,
-            // rejecting keeps every decoded symbol meaningful
-            if (v >= x12_enums[ad->enum_id].symbol_count) {
+            // rejecting keeps every decoded symbol meaningful. a bad
+            // table entry fails closed too
+            if (ad->enum_id >= x12_enums_count ||
+                v >= x12_enums[ad->enum_id].symbol_count) {
                 return X12_ERR_FRAME;
             }
             a->u64 = v;
