@@ -19,8 +19,6 @@
 
 #include <stddef.h>
 #include <stdint.h>
-
-#include <stddef.h>
 #include <sys/types.h>
 
 #define X12_NET_UNIX 0
