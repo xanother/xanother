@@ -71,6 +71,8 @@ uint64_t x12_conn_mint_session(struct x12_conn *c) {
         close(fd);
     }
     if (token == 0) {
+        // no entropy source: the token is guessable, say so out loud
+        fprintf(stderr, "x12-server: no entropy, session tokens are weak\n");
         token = (uint64_t)x12_now_ns() ^ ((uint64_t)(uintptr_t)c << 32);
     }
     // zero is the "no session" marker, never hand it out
