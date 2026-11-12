@@ -169,6 +169,7 @@ x12c *x12c_connect(const char *path, x12c_handler handler) {
     x12_arg hello[2] = { { .u64 = X12_IDL_FORMAT }, { .u64 = 0 } };
     if (encode_into(c, "x12_connection", "hello", 1, hello, 2) != 0 ||
         flush_out(c) != 0) {
+        x12_net_tls_free(c->tls);
         close(c->fd);
         free(c);
         return 0;
