@@ -87,10 +87,12 @@ static void on_event(x12c *c, const x12c_proxy *p,
                     x12c_call(session, "x12_buffer", "destroy", p->id,
                               0, 0);
                     buf_retired[i] = buf_retired[--buf_retired_n];
-                    released = 1;
                     break;
                 }
             }
+            // every release is a frame the server is done with, that
+            // is one paint slot free no matter which buffer it names
+            released = 1;
         }
         return;
     }
@@ -505,6 +507,7 @@ int x12_bridge_gate_open(void)
     return released != 0 && pool_pix != NULL;
 }
 
+
 // a damage mark only: the surface accumulates the rows, the commit
 // that follows publishes them all at once. the pump runs one commit
 // per flush - a commit per box closed the gate on the first box and
@@ -614,10 +617,16 @@ x12_bridge_dmabuf_attach(int fd, uint32_t stride, uint64_t modifier,
                     bufman_id, a, 7, 0, fd) != 0) {
         return -1;
     }
-    // the first import takes the pool buffer off the surface, the
-    // release contract allows its destroy right away
+    // the first import takes the pool buffer off the surface. the
+    // frame that committed with it is still in flight: destroying here
+    // waives the release credit the paint gate is waiting on, the
+    // buffer joins the retire ring and dies on its release like every
+    // other swapped out one
     if (dmabuf_slots == 0 && buf_id) {
-        x12c_call(session, "x12_buffer", "destroy", buf_id, 0, 0);
+        if (buf_retired_n <
+            (int)(sizeof buf_retired / sizeof *buf_retired)) {
+            buf_retired[buf_retired_n++] = buf_id;
+        }
         buf_id = 0;
     }
     dmabuf_active = 1;
