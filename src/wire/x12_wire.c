@@ -175,10 +175,18 @@ static int arg_size(const x12_arg_desc *ad, const x12_arg *a, size_t *out) {
         if (!a->str) {
             return X12_ERR_ARG;
         }
+        // no frame can carry anything near this, rejecting up front
+        // keeps the size math below untouchable by a bogus length
+        if (a->str_len > 0x3FFFFFFFu) {
+            return X12_ERR_ARG;
+        }
         *out = 4 + align4(a->str_len);
         return X12_OK;
     case X12_ARG_ARRAY_U32:
         if (a->array_len && !a->array) {
+            return X12_ERR_ARG;
+        }
+        if (a->array_len > 0x3FFFFFFFu) {
             return X12_ERR_ARG;
         }
         *out = 4 + 4u * (size_t)a->array_len;
