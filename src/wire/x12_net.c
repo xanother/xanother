@@ -421,6 +421,11 @@ x12_net_wrap(int net, uint8_t *dst, size_t dstcap,
         memcpy(dst, frame, len);
         return len;
     }
+    // the wire never carries frames past the maximum, refuse instead
+    // of truncating the length into the header
+    if (len > X12_NET_MAX_FRAME) {
+        return 0;
+    }
     uint32_t raw_len = (uint32_t)len;
     uint8_t comp[X12_NET_MAX_FRAME];
     uint32_t comp_len = 0;
