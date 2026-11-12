@@ -64,6 +64,9 @@ def random_arg(rng, arg, enum_lookup, iface_name):
         alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789абвгд"
         n = rng.randrange(0, 16)
         return "".join(rng.choice(alphabet) for _ in range(n))
+    if t == "bytes":
+        n = rng.randrange(0, 24)
+        return bytes(rng.randrange(0, 256) for _ in range(n))
     if t == "array_u32":
         return [rng.randrange(0, 2 ** 32) for _ in range(rng.randrange(0, 5))]
     raise ValueError(f"unhandled type {t}")
