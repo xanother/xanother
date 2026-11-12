@@ -346,6 +346,10 @@ x12_net_read(void *tls, int fd, void *buf, size_t n)
     if (!tls) {
         return recv(fd, buf, n, 0);
     }
+    // ssl takes an int, a bigger request would truncate silently
+    if (n > (size_t)INT_MAX) {
+        n = (size_t)INT_MAX;
+    }
     int r = SSL_read((SSL *)tls, buf, (int)n);
     if (r > 0) {
         return r;
@@ -368,6 +372,9 @@ x12_net_write(void *tls, int fd, const void *buf, size_t n)
 {
     if (!tls) {
         return send(fd, buf, n, MSG_NOSIGNAL);
+    }
+    if (n > (size_t)INT_MAX) {
+        n = (size_t)INT_MAX;
     }
     int r = SSL_write((SSL *)tls, buf, (int)n);
     if (r > 0) {
