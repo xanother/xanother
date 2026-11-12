@@ -104,6 +104,9 @@ const x12_iface_desc *x12_iface_find(const char *name) {
 }
 
 const x12_msg_desc *x12_msg_find(const x12_iface_desc *iface, uint8_t kind, uint16_t opcode) {
+    if (!iface) {
+        return 0;
+    }
     for (uint16_t i = 0; i < iface->msg_count; i++) {
         const x12_msg_desc *m = &iface->msgs[i];
         if (m->kind == kind && m->opcode == opcode) {
@@ -114,6 +117,9 @@ const x12_msg_desc *x12_msg_find(const x12_iface_desc *iface, uint8_t kind, uint
 }
 
 const x12_msg_desc *x12_msg_find_name(const x12_iface_desc *iface, uint8_t kind, const char *name) {
+    if (!iface) {
+        return 0;
+    }
     for (uint16_t i = 0; i < iface->msg_count; i++) {
         const x12_msg_desc *m = &iface->msgs[i];
         if (m->kind == kind && strcmp(m->name, name) == 0) {
