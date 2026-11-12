@@ -86,11 +86,12 @@ int x12_conn_park(struct x12_conn *c, uint64_t ttl_ns) {
         return 0;
     }
     // whatever the transport had not finished dies with it, the client
-    // rebuilds its state on resume
+    // rebuilds its state on resume. descriptors that never reached
+    // either side go back to the kernel instead of vanishing with the
+    // counters
+    x12_conn_release_fds(c);
     c->in_len = 0;
     c->out_len = 0;
-    c->n_in_fds = 0;
-    c->n_out_fds = 0;
     c->parked = 1;
     c->park_deadline = x12_now_ns() + ttl_ns;
     parked[n_parked++] = c;
