@@ -2,8 +2,11 @@
 # Copyright (c) lezginskiy <xanother-x12@proton.me>
 # SPDX-License-Identifier: MIT
 
-# builds the server and the c roundtrip gate into build/, codegen first.
-# warnings are errors, the gate is the gate
+# builds the world into build/: the server, the c gates and the bridge
+# with the x12 ddx on top of the vendored xserver, codegen first.
+# warnings are errors, the gate is the gate. the bridge needs the meson
+# and ninja toolchain plus the xorg dependency set from bootstrap.sh,
+# a build without the bridge is no build at all
 
 set -e
 cd "$(dirname "$0")/.."
@@ -56,5 +59,13 @@ gcc $CFLAGS -o build/c_gbm_present \
     src/render/cpu.c \
     src/render/gpu.c \
     -ldl -lm
+
+# the bridge rides along: one build call produces the server and the
+# x12 ddx together
+if ! command -v meson >/dev/null 2>&1 || ! command -v ninja >/dev/null 2>&1; then
+    echo "build: the bridge needs meson and ninja, run bootstrap.sh first" >&2
+    exit 1
+fi
+sh tools/bridge_build.sh
 
 echo "build ok"
