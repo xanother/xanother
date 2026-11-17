@@ -24,7 +24,8 @@ usage: x12start [options] [command ...]
   -s WxH        canvas size (default 1280x800)
   -sock ADDR    x12 listen address (default /tmp/x12-<uid>.sock)
   -ppm PATH     write the frame to a ppm after every draw
-  -kms          output to real drm instead of the headless canvas
+  -kms          output to the real drm screen (card from X12_KMS_NODE
+                or the first under /dev/dri)
   -gpu          blend on the gl canvas
   -grants LIST  comm names the isolation lets see the window tree
   -h            this help
@@ -35,7 +36,8 @@ starter ~/.x12initrc and runs it.
 
 with neither -ppm nor -kms the picture goes to the real drm screen
 when there is one and falls back to a ppm file when there is not -
-the path is printed at startup.
+the path is printed at startup. the drm screen needs a free card, so
+stop the login manager and run from a tty, exactly like startx.
 EOF
     exit "${1:-0}"
 }
@@ -124,6 +126,14 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 
+# the kms backend names its drm card explicitly
+kms_node=${X12_KMS_NODE:-}
+if [ -z "$kms_node" ]; then
+    for n in /dev/dri/card*; do
+        [ -e "$n" ] && { kms_node=$n; break; }
+    done
+fi
+
 # where the picture goes: the flags decide, otherwise the real screen
 # when there is drm and a ppm we can watch when there is not
 gl=
@@ -132,26 +142,33 @@ frame=
 run_kms=no
 auto_kms=no
 if [ "$kms" = yes ]; then
+    [ -n "$kms_node" ] || {
+        echo "x12start: no drm node under /dev/dri" >&2
+        exit 1
+    }
     run_kms=yes
     frame=$ppm
 elif [ -n "$ppm" ]; then
     frame=$ppm
-elif [ -e /dev/dri/card0 ]; then
+elif [ -n "$kms_node" ]; then
     run_kms=yes
     auto_kms=yes
 else
     frame=${TMPDIR:-/tmp}/x12-$(id -u).ppm
 fi
 
-# the headless backend serves every transport, --kms swaps in real drm.
-# the first attempt can lose the drm race to a login manager - that is
+# the whole startup runs as one attempt so that any death before the
+# session - a refused drm master included - lands in the same place.
+# the first attempt can lose the drm race to a login manager, that is
 # not fatal, the ppm is
 attempt=1
 while :; do
     if [ "$run_kms" = yes ] && [ -n "$frame" ]; then
-        "$server" "$sock" --width "$w" --height "$h" $gl --kms --ppm "$frame" &
+        "$server" "$sock" --width "$w" --height "$h" $gl \
+            --kms "$kms_node" --ppm "$frame" &
     elif [ "$run_kms" = yes ]; then
-        "$server" "$sock" --width "$w" --height "$h" $gl --kms &
+        "$server" "$sock" --width "$w" --height "$h" $gl \
+            --kms "$kms_node" &
     elif [ -n "$frame" ]; then
         "$server" "$sock" --width "$w" --height "$h" $gl --ppm "$frame" &
     else
@@ -173,16 +190,53 @@ while :; do
         sleep 1
         tries=$((tries + 1))
     done
+
+    # the socket appears before the backend finishes initializing, so
+    # give a refused drm master a moment to land before believing it
+    if [ "$up" = yes ]; then
+        sleep 1
+        kill -0 "$server_pid" 2>/dev/null || up=no
+    fi
+
+    # the bridge is the x server the session talks to
+    if [ "$up" = yes ]; then
+        X12_BRIDGE_SOCKET=$sock X12_BRIDGE_GRANTS=$grants \
+        X12_BRIDGE_WIDTH=$w X12_BRIDGE_HEIGHT=$h \
+            "$bridge" "$display" -ac -noreset &
+        bridge_pid=$!
+
+        # the x socket appears before the server finishes
+        # initializing, so a display query is the readiness check
+        # when x11-utils is around
+        tries=0
+        while [ "$tries" -lt 10 ]; do
+            kill -0 "$bridge_pid" 2>/dev/null || { up=no; break; }
+            kill -0 "$server_pid" 2>/dev/null || { up=no; break; }
+            if command -v xdpyinfo >/dev/null 2>&1; then
+                xdpyinfo -display "$display" >/dev/null 2>&1 && break
+            else
+                [ -e "/tmp/.X11-unix/X$num" ] && break
+            fi
+            sleep 1
+            tries=$((tries + 1))
+        done
+    fi
     [ "$up" = yes ] && break
+
+    # this attempt is dead, sweep it away whole
+    [ -n "$bridge_pid" ] && kill -9 "$bridge_pid" 2>/dev/null
+    [ -n "$server_pid" ] && kill -9 "$server_pid" 2>/dev/null
+    bridge_pid=
+    server_pid=
+    rm -f "/tmp/.X$num-lock" "/tmp/.X11-unix/X$num"
+    case $sock in
+    tcp:*|tls:*) ;;
+    *) rm -f "$sock";;
+    esac
 
     if [ "$auto_kms" = yes ] && [ "$attempt" -eq 1 ]; then
         echo "x12start: no drm output, falling back to a ppm" >&2
-        kill -9 "$server_pid" 2>/dev/null
-        server_pid=
-        case $sock in
-        tcp:*|tls:*) ;;
-        *) rm -f "$sock";;
-        esac
+        echo "x12start: stop the login manager and run from a tty for the real screen" >&2
         run_kms=no
         auto_kms=no
         frame=${TMPDIR:-/tmp}/x12-$(id -u).ppm
@@ -190,40 +244,14 @@ while :; do
         continue
     fi
 
-    echo "x12start: server failed to start (errors above)" >&2
-    [ "$kms" = yes ] && echo "x12start: a login manager may own the drm, try -ppm" >&2
+    echo "x12start: startup failed (errors above)" >&2
+    [ "$kms" = yes ] && \
+        echo "x12start: a session may own the drm - stop the login manager and run from a tty, or use -ppm" >&2
     exit 1
 done
-
-# the bridge is the x server the session talks to
-X12_BRIDGE_SOCKET=$sock X12_BRIDGE_GRANTS=$grants \
-X12_BRIDGE_WIDTH=$w X12_BRIDGE_HEIGHT=$h \
-    "$bridge" "$display" -ac -noreset &
-bridge_pid=$!
-
-# the x socket appears before the server finishes initializing, so a
-# display query is the readiness check when x11-utils is around
-up=no
-tries=0
-while [ "$tries" -lt 10 ]; do
-    kill -0 "$bridge_pid" 2>/dev/null || break
-    kill -0 "$server_pid" 2>/dev/null || break
-    if command -v xdpyinfo >/dev/null 2>&1; then
-        xdpyinfo -display "$display" >/dev/null 2>&1 && { up=yes; break; }
-    else
-        [ -e "/tmp/.X11-unix/X$num" ] && { up=yes; break; }
-    fi
-    sleep 1
-    tries=$((tries + 1))
-done
-[ "$up" = yes ] || {
-    echo "x12start: bridge failed to start (errors above)" >&2
-    [ "$kms" = yes ] && echo "x12start: a login manager may own the drm, try -ppm" >&2
-    exit 1
-}
 
 note=
-[ "$run_kms" = yes ] && note=", on drm"
+[ "$run_kms" = yes ] && note=", on drm ($kms_node)"
 [ -n "$frame" ] && note="$note, frame in $frame"
 echo "x12start: session on $display (x12 on $sock)$note"
 
