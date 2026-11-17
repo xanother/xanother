@@ -23,7 +23,7 @@ usage: x12start [options] [command ...]
   -d DISPLAY    x display for the bridge (default :90)
   -s WxH        canvas size (default 1280x800)
   -sock ADDR    x12 listen address (default /tmp/x12-<uid>.sock)
-  -ppm PATH     also write the frame to a ppm after every draw
+  -ppm PATH     write the frame to a ppm after every draw
   -kms          output to real drm instead of the headless canvas
   -gpu          blend on the gl canvas
   -grants LIST  comm names the isolation lets see the window tree
@@ -32,6 +32,10 @@ usage: x12start [options] [command ...]
 with no command the session comes from ~/.x12initrc, falling back to
 ~/.xinitrc. with neither a command nor a config, x12start writes a
 starter ~/.x12initrc and runs it.
+
+with neither -ppm nor -kms the picture goes to the real drm screen
+when there is one and falls back to a ppm file when there is not -
+the path is printed at startup.
 EOF
     exit "${1:-0}"
 }
@@ -45,7 +49,8 @@ display=:90
 size=1280x800
 sock=/tmp/x12-$(id -u).sock
 ppm=
-extra=
+kms=no
+gpu=no
 grants=${X12_BRIDGE_GRANTS:-xwininfo,xdotool,xrandr}
 
 while [ $# -gt 0 ]; do
@@ -55,8 +60,8 @@ while [ $# -gt 0 ]; do
     -sock)   [ $# -ge 2 ] || usage 1; sock=$2; shift 2;;
     -ppm)    [ $# -ge 2 ] || usage 1; ppm=$2; shift 2;;
     -grants) [ $# -ge 2 ] || usage 1; grants=$grants,$2; shift 2;;
-    -kms)    extra="$extra --kms"; shift;;
-    -gpu)    extra="$extra --gpu"; shift;;
+    -kms)    kms=yes; shift;;
+    -gpu)    gpu=yes; shift;;
     -h)      usage 0;;
     --)      shift; break;;
     -*)      echo "x12start: unknown option $1" >&2; usage 1;;
@@ -66,6 +71,13 @@ done
 
 [ -x "$server" ] || { echo "x12start: no $server, run sh tools/build.sh" >&2; exit 1; }
 [ -x "$bridge" ] || { echo "x12start: no $bridge, run sh tools/bridge_build.sh" >&2; exit 1; }
+
+# the x server compiles its keymap with xkbcomp and dies without it
+if [ ! -x /usr/bin/xkbcomp ] && ! command -v xkbcomp >/dev/null 2>&1; then
+    echo "x12start: no xkbcomp, the x keyboard compiler" >&2
+    echo "x12start: install x11-xkb-utils (deb) or xorg-xkbcomp (arch)" >&2
+    exit 1
+fi
 
 w=${size%x*}
 h=${size#*x}
@@ -112,27 +124,76 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 
-# the headless backend serves every transport, --kms swaps in real drm
-if [ -n "$ppm" ]; then
-    "$server" "$sock" --width "$w" --height "$h" $extra --ppm "$ppm" &
+# where the picture goes: the flags decide, otherwise the real screen
+# when there is drm and a ppm we can watch when there is not
+gl=
+[ "$gpu" = yes ] && gl=--gpu
+frame=
+run_kms=no
+auto_kms=no
+if [ "$kms" = yes ]; then
+    run_kms=yes
+    frame=$ppm
+elif [ -n "$ppm" ]; then
+    frame=$ppm
+elif [ -e /dev/dri/card0 ]; then
+    run_kms=yes
+    auto_kms=yes
 else
-    "$server" "$sock" --width "$w" --height "$h" $extra &
+    frame=${TMPDIR:-/tmp}/x12-$(id -u).ppm
 fi
-server_pid=$!
 
-# a unix socket is a file we can wait on, the network transports are
-# listening the moment the process starts
-case $sock in
-tcp:*|tls:*) ;;
-*)
+# the headless backend serves every transport, --kms swaps in real drm.
+# the first attempt can lose the drm race to a login manager - that is
+# not fatal, the ppm is
+attempt=1
+while :; do
+    if [ "$run_kms" = yes ] && [ -n "$frame" ]; then
+        "$server" "$sock" --width "$w" --height "$h" $gl --kms --ppm "$frame" &
+    elif [ "$run_kms" = yes ]; then
+        "$server" "$sock" --width "$w" --height "$h" $gl --kms &
+    elif [ -n "$frame" ]; then
+        "$server" "$sock" --width "$w" --height "$h" $gl --ppm "$frame" &
+    else
+        "$server" "$sock" --width "$w" --height "$h" $gl &
+    fi
+    server_pid=$!
+
+    # a unix socket is a file we can wait on, the network transports
+    # are listening the moment the process starts. a dead pid means
+    # the startup failed - stop waiting and say so
+    up=no
     tries=0
-    while [ ! -e "$sock" ] && [ "$tries" -lt 10 ]; do
+    while [ "$tries" -lt 10 ]; do
+        kill -0 "$server_pid" 2>/dev/null || break
+        case $sock in
+        tcp:*|tls:*) up=yes; break;;
+        esac
+        [ -e "$sock" ] && { up=yes; break; }
         sleep 1
         tries=$((tries + 1))
     done
-    [ -e "$sock" ] || { echo "x12start: server socket never appeared" >&2; exit 1; }
-    ;;
-esac
+    [ "$up" = yes ] && break
+
+    if [ "$auto_kms" = yes ] && [ "$attempt" -eq 1 ]; then
+        echo "x12start: no drm output, falling back to a ppm" >&2
+        kill -9 "$server_pid" 2>/dev/null
+        server_pid=
+        case $sock in
+        tcp:*|tls:*) ;;
+        *) rm -f "$sock";;
+        esac
+        run_kms=no
+        auto_kms=no
+        frame=${TMPDIR:-/tmp}/x12-$(id -u).ppm
+        attempt=2
+        continue
+    fi
+
+    echo "x12start: server failed to start (errors above)" >&2
+    [ "$kms" = yes ] && echo "x12start: a login manager may own the drm, try -ppm" >&2
+    exit 1
+done
 
 # the bridge is the x server the session talks to
 X12_BRIDGE_SOCKET=$sock X12_BRIDGE_GRANTS=$grants \
@@ -140,14 +201,32 @@ X12_BRIDGE_WIDTH=$w X12_BRIDGE_HEIGHT=$h \
     "$bridge" "$display" -ac -noreset &
 bridge_pid=$!
 
+# the x socket appears before the server finishes initializing, so a
+# display query is the readiness check when x11-utils is around
+up=no
 tries=0
-while [ ! -e "/tmp/.X11-unix/X$num" ] && [ "$tries" -lt 10 ]; do
+while [ "$tries" -lt 10 ]; do
+    kill -0 "$bridge_pid" 2>/dev/null || break
+    kill -0 "$server_pid" 2>/dev/null || break
+    if command -v xdpyinfo >/dev/null 2>&1; then
+        xdpyinfo -display "$display" >/dev/null 2>&1 && { up=yes; break; }
+    else
+        [ -e "/tmp/.X11-unix/X$num" ] && { up=yes; break; }
+    fi
     sleep 1
     tries=$((tries + 1))
 done
-[ -e "/tmp/.X11-unix/X$num" ] || { echo "x12start: bridge display never appeared" >&2; exit 1; }
+[ "$up" = yes ] || {
+    echo "x12start: bridge failed to start (errors above)" >&2
+    [ "$kms" = yes ] && echo "x12start: a login manager may own the drm, try -ppm" >&2
+    exit 1
+}
 
-echo "x12start: session on $display (x12 on $sock)"
+note=
+[ "$run_kms" = yes ] && note=", on drm"
+[ -n "$frame" ] && note="$note, frame in $frame"
+echo "x12start: session on $display (x12 on $sock)$note"
+
 DISPLAY=:$num
 export DISPLAY
 

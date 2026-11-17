@@ -58,7 +58,7 @@ sh tools/x12start -kms fvwm3          # output to real drm
 sh tools/x12start -ppm frame.ppm      # keep the frame on disk
 ```
 
-Options: `-d` display for the bridge, `-s` canvas size, `-sock` listen address, `-ppm`, `-kms`, `-gpu`, `-grants` (comma-separated process names the isolation lets see the window tree).
+Options: `-d` display for the bridge, `-s` canvas size, `-sock` listen address, `-ppm`, `-kms`, `-gpu`, `-grants` (comma-separated process names the isolation lets see the window tree). with neither `-ppm` nor `-kms` the picture goes to the real drm screen when there is one and falls back to a ppm file when there is not - the path is printed at startup. the x keyboard compiler (`x11-xkb-utils` on deb, `xorg-xkbcomp` on arch) is needed to build the keymap.
 
 The long form, piece by piece - server first. The first argument is the address, in three forms:
 
