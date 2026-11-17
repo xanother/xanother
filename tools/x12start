@@ -1,0 +1,162 @@
+#!/bin/sh
+# Copyright (c) lezginskiy <xanother-x12@proton.me>
+# SPDX-License-Identifier: MIT
+
+# x12start - one command to bring up an x12 session, in the spirit of
+# startx. it runs the x12 server and the x12 x11 bridge, then hands the
+# display to a session just like xorg hands it to ~/.xinitrc:
+#
+#   x12start                      runs ~/.x12initrc (or ~/.xinitrc)
+#   x12start fvwm3                runs that command as the session
+#   x12start -d :92 -s 1600x900 i3
+#
+# the session script is a plain shell script like ~/.xinitrc: helper
+# programs go to the background with & and the window manager comes
+# last with exec, so the session lives exactly as long as the manager.
+# when it exits the servers come down with it.
+
+set -u
+
+usage() {
+    cat <<'EOF'
+usage: x12start [options] [command ...]
+  -d DISPLAY    x display for the bridge (default :90)
+  -s WxH        canvas size (default 1280x800)
+  -sock ADDR    x12 listen address (default /tmp/x12-<uid>.sock)
+  -ppm PATH     also write the frame to a ppm after every draw
+  -kms          output to real drm instead of the headless canvas
+  -gpu          blend on the gl canvas
+  -grants LIST  comm names the isolation lets see the window tree
+  -h            this help
+
+with no command the session comes from ~/.x12initrc, falling back to
+~/.xinitrc. with neither a command nor a config, x12start writes a
+starter ~/.x12initrc and runs it.
+EOF
+    exit "${1:-0}"
+}
+
+here=$(dirname "$0")
+build=${X12_BUILD:-"$here/../build"}
+server=${X12_SERVER:-"$build/x12-server"}
+bridge=${X12_BRIDGE:-"$build/vendor/xserver/build/hw/x12/Xx12"}
+
+display=:90
+size=1280x800
+sock=/tmp/x12-$(id -u).sock
+ppm=
+extra=
+grants=${X12_BRIDGE_GRANTS:-xwininfo,xdotool,xrandr}
+
+while [ $# -gt 0 ]; do
+    case $1 in
+    -d)      [ $# -ge 2 ] || usage 1; display=$2; shift 2;;
+    -s)      [ $# -ge 2 ] || usage 1; size=$2; shift 2;;
+    -sock)   [ $# -ge 2 ] || usage 1; sock=$2; shift 2;;
+    -ppm)    [ $# -ge 2 ] || usage 1; ppm=$2; shift 2;;
+    -grants) [ $# -ge 2 ] || usage 1; grants=$grants,$2; shift 2;;
+    -kms)    extra="$extra --kms"; shift;;
+    -gpu)    extra="$extra --gpu"; shift;;
+    -h)      usage 0;;
+    --)      shift; break;;
+    -*)      echo "x12start: unknown option $1" >&2; usage 1;;
+    *)       break;;
+    esac
+done
+
+[ -x "$server" ] || { echo "x12start: no $server, run sh tools/build.sh" >&2; exit 1; }
+[ -x "$bridge" ] || { echo "x12start: no $bridge, run sh tools/bridge_build.sh" >&2; exit 1; }
+
+w=${size%x*}
+h=${size#*x}
+num=${display#:}
+num=${num%%.*}
+
+[ -e "/tmp/.X11-unix/X$num" ] && {
+    echo "x12start: display $display is busy, pick another with -d" >&2
+    exit 1
+}
+
+# the starter config keeps the xinitrc recipes next to the one line
+# that picks the window manager
+if [ $# -eq 0 ] && [ ! -f "$HOME/.x12initrc" ] && [ ! -f "$HOME/.xinitrc" ]; then
+    cat > "$HOME/.x12initrc" <<'EOF'
+# the x12 session, in the spirit of ~/.xinitrc: helpers go to the
+# background with &, the window manager comes last with exec.
+
+xsetroot -solid "#204060" &
+
+# pick your session:
+exec xterm
+# exec fvwm3
+# exec i3
+# exec dbus-run-session -- sh -c 'kwin_x11 & plasmashell & wait'
+EOF
+    echo "x12start: wrote ~/.x12initrc, edit it to pick your window manager"
+fi
+
+server_pid=
+bridge_pid=
+cleanup() {
+    [ -n "$bridge_pid" ] && kill "$bridge_pid" 2>/dev/null
+    [ -n "$server_pid" ] && kill "$server_pid" 2>/dev/null
+    sleep 1
+    [ -n "$bridge_pid" ] && kill -9 "$bridge_pid" 2>/dev/null
+    [ -n "$server_pid" ] && kill -9 "$server_pid" 2>/dev/null
+    rm -f "/tmp/.X$num-lock" "/tmp/.X11-unix/X$num"
+    case $sock in
+    tcp:*|tls:*) ;;
+    *) rm -f "$sock";;
+    esac
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM HUP
+
+# the headless backend serves every transport, --kms swaps in real drm
+if [ -n "$ppm" ]; then
+    "$server" "$sock" --width "$w" --height "$h" $extra --ppm "$ppm" &
+else
+    "$server" "$sock" --width "$w" --height "$h" $extra &
+fi
+server_pid=$!
+
+# a unix socket is a file we can wait on, the network transports are
+# listening the moment the process starts
+case $sock in
+tcp:*|tls:*) ;;
+*)
+    tries=0
+    while [ ! -e "$sock" ] && [ "$tries" -lt 10 ]; do
+        sleep 1
+        tries=$((tries + 1))
+    done
+    [ -e "$sock" ] || { echo "x12start: server socket never appeared" >&2; exit 1; }
+    ;;
+esac
+
+# the bridge is the x server the session talks to
+X12_BRIDGE_SOCKET=$sock X12_BRIDGE_GRANTS=$grants \
+X12_BRIDGE_WIDTH=$w X12_BRIDGE_HEIGHT=$h \
+    "$bridge" "$display" -ac -noreset &
+bridge_pid=$!
+
+tries=0
+while [ ! -e "/tmp/.X11-unix/X$num" ] && [ "$tries" -lt 10 ]; do
+    sleep 1
+    tries=$((tries + 1))
+done
+[ -e "/tmp/.X11-unix/X$num" ] || { echo "x12start: bridge display never appeared" >&2; exit 1; }
+
+echo "x12start: session on $display (x12 on $sock)"
+DISPLAY=:$num
+export DISPLAY
+
+status=0
+if [ $# -gt 0 ]; then
+    "$@" || status=$?
+elif [ -f "$HOME/.x12initrc" ]; then
+    sh "$HOME/.x12initrc" || status=$?
+else
+    sh "$HOME/.xinitrc" || status=$?
+fi
+exit $status
