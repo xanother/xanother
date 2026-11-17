@@ -326,7 +326,13 @@ x12_net_connect(const struct x12_net_addr *a, void **tls_out)
                 X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), a->host);
             }
             else {
+#if OPENSSL_VERSION_NUMBER >= 0x40000000L
+                // openssl 4 deprecated set1_host, dnsname is the
+                // narrow replacement with the same check
+                SSL_set1_dnsname(ssl, a->host);
+#else
                 SSL_set1_host(ssl, a->host);
+#endif
             }
         }
         if (SSL_connect(ssl) != 1) {
