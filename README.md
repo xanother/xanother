@@ -43,17 +43,32 @@ The bridge is built from the vendored xorg xserver in `third-party/` - this is d
 
 ## How to run
 
-Server:
+One command, in the spirit of startx:
 
 ```
-./build/x12-server /tmp/x12.sock --width 1280 --height 720 --ppm frame.ppm
+sh tools/x12start fvwm3
 ```
 
-The first argument is the address, in three forms:
+`x12start` starts the server and the bridge and hands the display to a session, just like xorg hands it to `~/.xinitrc`. with no command it runs `~/.x12initrc`, falling back to `~/.xinitrc`; with no config at all it writes a starter one with recipes for fvwm, i3 and plasma. the session is a plain shell script: helpers go to the background with `&`, the window manager comes last with `exec` and ends the session when it exits.
+
+```
+sh tools/x12start                     # the session from ~/.x12initrc
+sh tools/x12start -s 1600x900 i3      # bigger canvas
+sh tools/x12start -kms fvwm3          # output to real drm
+sh tools/x12start -ppm frame.ppm      # keep the frame on disk
+```
+
+Options: `-d` display for the bridge, `-s` canvas size, `-sock` listen address, `-ppm`, `-kms`, `-gpu`, `-grants` (comma-separated process names the isolation lets see the window tree).
+
+The long form, piece by piece - server first. The first argument is the address, in three forms:
 
 - `/path` or `unix:/path` - a unix socket, the only transport that can pass file descriptors;
 - `tcp:HOST:PORT` - plain tcp;
 - `tls:HOST:PORT` - tls over tcp.
+
+```
+./build/x12-server /tmp/x12.sock --width 1280 --height 720 --ppm frame.ppm
+```
 
 Flags: `--ppm PATH` (headless mode, the server writes the frame after every draw), `--width` / `--height`, `--heads N` (multiple heads), `--gpu` and `--gpu-node /dev/dri/renderD128` (GL canvas), `--kms` (output to real DRM), `--input FIFO` (input as lines: `motion X Y`, `button N press|release`, `key K press|release`), `--evdev NODE` (multiple allowed).
 
