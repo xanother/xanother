@@ -862,6 +862,17 @@ int x12_handle_positioner(struct x12_conn *c, uint32_t object,
     return 0;
 }
 
+// a hard length clip can land in the middle of a utf8 sequence and
+// hand the compositor a garbled title, so back off to a char boundary
+static uint32_t
+clip_utf8(const char *s, uint32_t n)
+{
+    while (n > 0 && ((unsigned char)s[n] & 0xC0) == 0x80) {
+        n--;
+    }
+    return n;
+}
+
 int x12_handle_toplevel(struct x12_conn *c, uint32_t object,
                         const x12_msg_desc *msg, const x12_arg *args) {
     struct x12_object *o = x12_objects_get(&c->objects, object);
@@ -873,7 +884,9 @@ int x12_handle_toplevel(struct x12_conn *c, uint32_t object,
     if (strcmp(msg->name, "set_title") == 0) {
         uint32_t n = args[0].str_len;
         if (n >= sizeof t->title) {
-            n = (uint32_t)sizeof t->title - 1;
+            // the source is longer than the clip point, so the byte
+            // under n is inside the string
+            n = clip_utf8(args[0].str, (uint32_t)sizeof t->title - 1);
         }
         memcpy(t->title, args[0].str, n);
         t->title[n] = 0;
@@ -882,7 +895,7 @@ int x12_handle_toplevel(struct x12_conn *c, uint32_t object,
     if (strcmp(msg->name, "set_app_id") == 0) {
         uint32_t n = args[0].str_len;
         if (n >= sizeof t->app_id) {
-            n = (uint32_t)sizeof t->app_id - 1;
+            n = clip_utf8(args[0].str, (uint32_t)sizeof t->app_id - 1);
         }
         memcpy(t->app_id, args[0].str, n);
         t->app_id[n] = 0;
