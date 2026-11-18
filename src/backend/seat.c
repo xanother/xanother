@@ -20,7 +20,6 @@
 #include <unistd.h>
 
 #include <systemd/sd-bus.h>
-#include <systemd/sd-login.h>
 #include <xf86drm.h>
 
 struct x12_seat {
@@ -133,35 +132,42 @@ static int on_resume_signal(sd_bus_message *m, void *ud, sd_bus_error *err) {
     return 0;
 }
 
-// the session path is what loginctl prints as the session id, the
-// encode keeps odd ids from breaking the object path
+// the session object path comes straight from logind through
+// getsessionbypid, so no id spelling of ours can disagree with the
+// one logind put in the object path
 static int logind_attach(struct x12_seat *s) {
     sd_bus_error err = SD_BUS_ERROR_NULL;
     sd_bus_message *m = NULL;
-    char *sid = NULL;
+    const char *path = NULL;
     int r, inactive = 0;
 
-    if (sd_pid_get_session(0, &sid) < 0) {
-        fprintf(stderr, "seat: no logind session here, raw open it is\n");
-        return -1;
-    }
     if (sd_bus_open_system(&s->bus) < 0) {
         fprintf(stderr, "seat: no system bus, raw open it is\n");
-        free(sid);
         return -1;
     }
-    if (sd_bus_path_encode("session", sid, &s->path) < 0) {
-        fprintf(stderr, "seat: session %s encodes badly\n", sid);
-        free(sid);
+    r = sd_bus_call_method(s->bus, "org.freedesktop.login1",
+                           "/org/freedesktop/login1",
+                           "org.freedesktop.login1.Manager", "GetSessionByPID",
+                           &err, &m, "u", (uint32_t)getpid());
+    if (r < 0) {
+        fprintf(stderr, "seat: no logind session here, raw open it is\n");
         goto fail;
     }
+    r = sd_bus_message_read(m, "o", &path);
+    if (r < 0 || !path) {
+        fprintf(stderr, "seat: the session has no object path\n");
+        goto fail;
+    }
+    s->path = strdup(path);
+    sd_bus_message_unref(m);
+    m = NULL;
+
     // control before devices, logind refuses takedevice otherwise
     r = sd_bus_call_method(s->bus, "org.freedesktop.login1", s->path,
                            "org.freedesktop.login1.Session", "TakeControl",
                            &err, NULL, "b", 0);
     if (r < 0) {
         fprintf(stderr, "seat: takecontrol refused: %s\n", err.message);
-        free(sid);
         goto fail;
     }
     s->controlled = 1;
@@ -170,18 +176,17 @@ static int logind_attach(struct x12_seat *s) {
                            &err, &m, "uu", s->major, s->minor);
     if (r < 0) {
         fprintf(stderr, "seat: takedevice refused: %s\n", err.message);
-        free(sid);
         goto fail;
     }
     r = sd_bus_message_read(m, "hb", &s->fd, &inactive);
     sd_bus_message_unref(m);
+    m = NULL;
     if (r < 0 || s->fd < 0) {
-        free(sid);
+        fprintf(stderr, "seat: takedevice gave no fd\n");
         goto fail;
     }
-    fprintf(stderr, "seat: session %s holds drm %u:%u\n", sid, s->major,
+    fprintf(stderr, "seat: session %s holds drm %u:%u\n", s->path, s->major,
             s->minor);
-    free(sid);
     sd_bus_error_free(&err);
 
     // pause/resume arrive as session signals, the filter keeps other
@@ -207,6 +212,7 @@ static int logind_attach(struct x12_seat *s) {
 
 fail:
     sd_bus_error_free(&err);
+    sd_bus_message_unref(m);
     if (s->controlled) {
         sd_bus_call_method(s->bus, "org.freedesktop.login1", s->path,
                            "org.freedesktop.login1.Session", "ReleaseControl",
