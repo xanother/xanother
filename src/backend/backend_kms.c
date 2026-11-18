@@ -78,6 +78,9 @@ struct output {
 static int card_fd = -1;
 static struct x12_seat *seat;
 static int seat_paused;
+// the ppm watch sits next to the real screen when a path was named,
+// the nameless fallback keeps pixels for the test tools
+static char ppm_path[512];
 static drmEventContext evctx;
 
 static void recheck_connectors(void);
@@ -609,6 +612,9 @@ static int kms_init(int argc, char **argv) {
         if (strcmp(argv[i], "--kms") == 0 && i + 1 < argc) {
             node = argv[i + 1];
         }
+        if (strcmp(argv[i], "--ppm") == 0 && i + 1 < argc) {
+            snprintf(ppm_path, sizeof ppm_path, "%s", argv[i + 1]);
+        }
     }
     if (!node) {
         fprintf(stderr, "x12-server: --kms needs a drm node\n");
@@ -808,7 +814,9 @@ static void kms_present(const uint32_t *fb, const struct x12_rect *rects,
         o->pending = cur;
         flipped = 1;
     }
-    if (!flipped) {
+    if (ppm_path[0]) {
+        write_ppm(ppm_path, fb, cw, ch);
+    } else if (!flipped) {
         // nothing live to show it on, keep the pixels around for the
         // test tools instead of dropping them silently
         write_ppm("screen.ppm", fb, cw, ch);
