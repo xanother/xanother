@@ -215,10 +215,16 @@ iso_client(ClientPtr client)
         return NULL;
     }
     ic = &iso_clients[idx];
-    if (!ic->resolved) {
-        ic->resolved = 1;
-        ic->pid = iso_peer_pid(client);
-        ic->grant_env = iso_granted(ic->pid);
+    {
+        // the client table recycles slots: a fresh connection must
+        // never inherit the grant of the dead one it replaced
+        pid_t pid = iso_peer_pid(client);
+        if (!ic->resolved || ic->pid != pid) {
+            ic->resolved = 1;
+            ic->pid = pid;
+            ic->grant_env = iso_granted(pid);
+            ic->grant_mgr = 0;
+        }
     }
     return ic;
 }
