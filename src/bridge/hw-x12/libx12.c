@@ -130,6 +130,10 @@ static int flush_out(struct x12c *c) {
             n = x12_net_write(NULL, c->fd, c->out + off, c->out_len - off);
         }
         if (n <= 0) {
+            // a half-written frame poisons the stream: there is no
+            // sane retry and the connection dies here, so the queue
+            // must not pretend its frames are still sendable
+            c->out_len = 0;
             return -1;
         }
         off += (size_t)n;
