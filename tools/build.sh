@@ -1,5 +1,6 @@
 #!/bin/sh
 # Copyright (c) lezginskiy <xanother-x12@proton.me>
+# Copyright (c) fluent1s (akemi) <m1st1kad3ad1y@gmail.com>
 # SPDX-License-Identifier: MIT
 
 # builds the world into build/: the server, the c gates and the bridge
@@ -14,9 +15,13 @@ cd "$(dirname "$0")/.."
 python3 tools/x12gen.py --lang c --out-dir build/gen
 
 CFLAGS="-std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -I src/wire -I src/core -I src/frame -I src/render -I src/backend -I src/input -I src/data -I build/gen"
-DRM_CFLAGS=$(pkg-config --cflags libdrm 2>/dev/null)
+# system headers hide behind pkg-config on some machines - ask for the
+# gles3 set first and fall back to gles2, no pkg-config at all just
+# leaves the default include paths
+SYS_CFLAGS=$(pkg-config --cflags libdrm xkbcommon egl glesv3 2>/dev/null || \
+    pkg-config --cflags libdrm xkbcommon egl glesv2 2>/dev/null || true)
 
-gcc $CFLAGS $DRM_CFLAGS -o build/x12-server \
+gcc $CFLAGS $SYS_CFLAGS -o build/x12-server \
     src/server/main.c \
     src/core/conn.c \
     src/wire/x12_net.c \
@@ -46,7 +51,7 @@ gcc $CFLAGS -o build/c_roundtrip \
 
 # the gpu canvas contract: cpu and gpu blend paths must agree byte for
 # byte, the binary degrades to SKIP on a box without a gl stack
-gcc $CFLAGS -o build/c_gpu_contract \
+gcc $CFLAGS $SYS_CFLAGS -o build/c_gpu_contract \
     tests/c_gpu_contract.c \
     src/render/cpu.c \
     src/render/gpu.c \
@@ -54,7 +59,7 @@ gcc $CFLAGS -o build/c_gpu_contract \
 
 # the gbm present smoke: real render node or nothing, the dma path has
 # to land the canvas byte exact on both scanout bos
-gcc $CFLAGS -o build/c_gbm_present \
+gcc $CFLAGS $SYS_CFLAGS -o build/c_gbm_present \
     tests/c_gbm_present.c \
     src/render/cpu.c \
     src/render/gpu.c \
