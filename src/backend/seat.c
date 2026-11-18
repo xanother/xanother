@@ -2,8 +2,12 @@
 // SPDX-License-Identifier: MIT
 
 // seat plumbing: logind takes the device under our session and pokes
-// us with pause/resume around vt switches, the raw fallback keeps the
-// old open+setmaster path alive for root consoles and containers
+// us with pause/resume around vt switches. the fd itself comes from
+// takedevice when the logind on the box passes live fds, some new ones
+// hand out numbers that die with the reply message and there the node
+// is opened raw with the master dance instead. the vt choreography is
+// watched through the session signals and the active property, so a
+// switch is caught either way
 
 #include "seat.h"
 
@@ -25,10 +29,13 @@
 struct x12_seat {
     const struct x12_seat_ops *ops;
     void *ud;
+    const char *node;
     int fd;
+    int own_fd;
     int paused;
     int controlled;
     int tty_fd;
+    int last_active;
     uint32_t major, minor;
 
     sd_bus *bus;
@@ -48,6 +55,110 @@ static void on_vt_away(int sig) {
 static void on_vt_back(int sig) {
     (void)sig;
     vt_want_back = 1;
+}
+
+static void seat_do_pause(struct x12_seat *s) {
+    if (s->paused) {
+        return;
+    }
+    s->paused = 1;
+    if (s->fd >= 0) {
+        drmDropMaster(s->fd);
+    }
+    fprintf(stderr, "seat: device paused, master dropped\n");
+    if (s->ops->on_pause) {
+        s->ops->on_pause(s->ud);
+    }
+}
+
+static void seat_do_resume(struct x12_seat *s) {
+    if (!s->paused) {
+        return;
+    }
+    if (s->fd >= 0) {
+        drmSetMaster(s->fd);
+    }
+    s->paused = 0;
+    fprintf(stderr, "seat: device resumed, master set\n");
+    if (s->ops->on_resume) {
+        s->ops->on_resume(s->ud, s->fd);
+    }
+}
+
+static int on_pause_signal(sd_bus_message *m, void *ud, sd_bus_error *err) {
+    struct x12_seat *s = ud;
+    uint32_t major = 0, minor = 0;
+    const char *type = NULL;
+    (void)err;
+    if (sd_bus_message_read(m, "uus", &major, &minor, &type) < 0) {
+        return 0;
+    }
+    if (major != s->major || minor != s->minor) {
+        return 0;
+    }
+    seat_do_pause(s);
+    // the pause is only complete once we say so
+    sd_bus_call_method(s->bus, "org.freedesktop.login1", s->path,
+                       "org.freedesktop.login1.Session", "PauseDeviceComplete",
+                       NULL, NULL, "uu", major, minor);
+    return 0;
+}
+
+static int on_resume_signal(sd_bus_message *m, void *ud, sd_bus_error *err) {
+    struct x12_seat *s = ud;
+    uint32_t major = 0, minor = 0;
+    int fd = -1;
+    (void)err;
+    if (sd_bus_message_read(m, "uh", &major, &minor, &fd) < 0) {
+        return 0;
+    }
+    if (major != s->major || minor != s->minor || fd < 0) {
+        return 0;
+    }
+    // a taken fd replaces the old one, our own raw fd stays as it is
+    // and just takes the master back
+    if (!s->own_fd) {
+        int fresh = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+        if (fresh >= 0) {
+            if (s->fd >= 0) {
+                close(s->fd);
+            }
+            s->fd = fresh;
+        }
+    }
+    seat_do_resume(s);
+    return 0;
+}
+
+// one look at the session active property tells whether the seat is
+// on the front vt, this is the switch tell that works even on the
+// logind builds whose device fds come back dead
+static void poll_active(struct x12_seat *s) {
+    sd_bus_error err = SD_BUS_ERROR_NULL;
+    sd_bus_message *m = NULL;
+    int active = 0;
+
+    if (!s->bus || !s->path) {
+        return;
+    }
+    if (sd_bus_get_property(s->bus, "org.freedesktop.login1", s->path,
+                            "org.freedesktop.login1.Session", "Active", &err,
+                            &m, "b") < 0) {
+        sd_bus_error_free(&err);
+        return;
+    }
+    sd_bus_message_read(m, "b", &active);
+    sd_bus_message_unref(m);
+    sd_bus_error_free(&err);
+    if (active == s->last_active) {
+        return;
+    }
+    s->last_active = active;
+    if (active) {
+        seat_do_resume(s);
+    } else {
+        seat_do_pause(s);
+    }
 }
 
 // without logind the vt dance is ours: process mode makes the kernel
@@ -80,61 +191,25 @@ static void vt_attach(struct x12_seat *s) {
     fprintf(stderr, "seat: holding the vt around switches\n");
 }
 
-static int on_pause_signal(sd_bus_message *m, void *ud, sd_bus_error *err) {
-    struct x12_seat *s = ud;
-    uint32_t major = 0, minor = 0;
-    const char *type = NULL;
-    (void)err;
-    if (sd_bus_message_read(m, "uus", &major, &minor, &type) < 0) {
-        return 0;
+// the fd logind passes must survive its reply message on every
+// systemd, when it does not the node is ours to open
+static int own_fd_open(struct x12_seat *s) {
+    s->own_fd = 1;
+    s->fd = open(s->node, O_RDWR | O_CLOEXEC);
+    if (s->fd < 0) {
+        fprintf(stderr, "seat: cannot open drm node %s: %s\n", s->node,
+                strerror(errno));
+        return -1;
     }
-    if (major != s->major || minor != s->minor) {
-        return 0;
+    if (drmSetMaster(s->fd) != 0) {
+        fprintf(stderr,
+                "seat: no drm master on %s, a session still owns it: %s\n",
+                s->node, strerror(errno));
+        close(s->fd);
+        s->fd = -1;
+        return -1;
     }
-    // "gone" is the device disappearing for good, "pause" is the vt
-    // switch dance: either way the fd goes quiet under us
-    s->paused = 1;
-    drmDropMaster(s->fd);
-    fprintf(stderr, "seat: device paused, master dropped\n");
-    if (s->ops->on_pause) {
-        s->ops->on_pause(s->ud);
-    }
-    // the pause is only complete once we say so
-    sd_bus_call_method(s->bus, "org.freedesktop.login1", s->path,
-                       "org.freedesktop.login1.Session", "PauseDeviceComplete",
-                       NULL, NULL, "uu", major, minor);
-    return 0;
-}
-
-static int on_resume_signal(sd_bus_message *m, void *ud, sd_bus_error *err) {
-    struct x12_seat *s = ud;
-    uint32_t major = 0, minor = 0;
-    int fd = -1;
-    (void)err;
-    if (sd_bus_message_read(m, "uh", &major, &minor, &fd) < 0) {
-        return 0;
-    }
-    if (major != s->major || minor != s->minor || fd < 0) {
-        return 0;
-    }
-    // same fd ownership dance as at takedevice time: the signal
-    // message reclaims its fd when the pump frees it
-    int fresh = fcntl(fd, F_DUPFD_CLOEXEC, 0);
-    if (fresh < 0) {
-        return 0;
-    }
-    // the old fd is a dead namespace for gem handles, the fresh one
-    // replaces it outright
-    int old = s->fd;
-    s->fd = fresh;
-    s->paused = 0;
-    if (old >= 0) {
-        close(old);
-    }
-    fprintf(stderr, "seat: device resumed on a fresh fd\n");
-    if (s->ops->on_resume) {
-        s->ops->on_resume(s->ud, fd);
-    }
+    fprintf(stderr, "seat: raw open on %s, master set\n", s->node);
     return 0;
 }
 
@@ -168,47 +243,63 @@ static int logind_attach(struct x12_seat *s) {
     sd_bus_message_unref(m);
     m = NULL;
 
-    // control before devices, logind refuses takedevice otherwise
+    // control before devices, logind refuses takedevice otherwise.
+    // without it the session still watches, it just never gets a fd
     r = sd_bus_call_method(s->bus, "org.freedesktop.login1", s->path,
                            "org.freedesktop.login1.Session", "TakeControl",
                            &err, NULL, "b", 0);
     if (r < 0) {
         fprintf(stderr, "seat: takecontrol refused: %s\n", err.message);
+        sd_bus_error_free(&err);
+        err = SD_BUS_ERROR_NULL;
+    } else {
+        s->controlled = 1;
+    }
+
+    if (s->controlled) {
+        r = sd_bus_call_method(s->bus, "org.freedesktop.login1", s->path,
+                               "org.freedesktop.login1.Session", "TakeDevice",
+                               &err, &m, "uu", s->major, s->minor);
+        if (r < 0) {
+            fprintf(stderr, "seat: takedevice refused: %s\n", err.message);
+            sd_bus_error_free(&err);
+            err = SD_BUS_ERROR_NULL;
+        } else {
+            int raw = -1;
+            sd_bus_message_read(m, "hb", &raw, &inactive);
+            sd_bus_message_unref(m);
+            m = NULL;
+            if (raw >= 0) {
+                s->fd = fcntl(raw, F_DUPFD_CLOEXEC, 0);
+            }
+            if (s->fd >= 0) {
+                s->paused = inactive ? 1 : 0;
+                fprintf(stderr, "seat: session %s holds drm %u:%u\n", s->path,
+                        s->major, s->minor);
+            } else {
+                // the fd died with its message, this logind passes
+                // numbers where the socket carried none
+                fprintf(stderr,
+                        "seat: the takedevice fd came back dead, taking "
+                        "our own\n");
+                sd_bus_call_method(s->bus, "org.freedesktop.login1", s->path,
+                                   "org.freedesktop.login1.Session",
+                                   "ReleaseDevice", NULL, NULL, "uu", s->major,
+                                   s->minor);
+                sd_bus_call_method(s->bus, "org.freedesktop.login1", s->path,
+                                   "org.freedesktop.login1.Session",
+                                   "ReleaseControl", NULL, NULL, NULL);
+                s->controlled = 0;
+            }
+        }
+    }
+    if (s->fd < 0 && own_fd_open(s) != 0) {
         goto fail;
     }
-    s->controlled = 1;
-    r = sd_bus_call_method(s->bus, "org.freedesktop.login1", s->path,
-                           "org.freedesktop.login1.Session", "TakeDevice",
-                           &err, &m, "uu", s->major, s->minor);
-    if (r < 0) {
-        fprintf(stderr, "seat: takedevice refused: %s\n", err.message);
-        goto fail;
-    }
-    int raw = -1;
-    r = sd_bus_message_read(m, "hb", &raw, &inactive);
-    sd_bus_message_unref(m);
-    m = NULL;
-    if (r < 0 || raw < 0) {
-        fprintf(stderr, "seat: takedevice gave no fd\n");
-        goto fail;
-    }
-    // the message owns the fd it carried and closes it on unref on
-    // some systemd versions, a dup of ours survives every reading of
-    // the rules
-    s->fd = fcntl(raw, F_DUPFD_CLOEXEC, 0);
-    if (s->fd < 0) {
-        fprintf(stderr, "seat: cannot dup the device fd\n");
-        goto fail;
-    }
-    // a device handed out inactive sits on a dark vt until its session
-    // comes back to the front
-    s->paused = inactive ? 1 : 0;
-    fprintf(stderr, "seat: session %s holds drm %u:%u%s\n", s->path, s->major,
-            s->minor, inactive ? " (paused, dark vt)" : "");
-    sd_bus_error_free(&err);
 
     // pause/resume arrive as session signals, the filter keeps other
-    // sessions off our plate
+    // sessions off our plate. the active poll covers the builds where
+    // the signals never come
     char match[512];
     snprintf(match, sizeof match,
              "type='signal',sender='org.freedesktop.login1',path='%s',"
@@ -226,6 +317,7 @@ static int logind_attach(struct x12_seat *s) {
     sd_bus_call_method(s->bus, "org.freedesktop.login1", s->path,
                        "org.freedesktop.login1.Session", "SetType", NULL,
                        NULL, "s", "x11");
+    sd_bus_error_free(&err);
     return 0;
 
 fail:
@@ -253,8 +345,10 @@ int x12_seat_open(struct x12_seat **out, const char *node,
     }
     s->ops = ops;
     s->ud = ud;
+    s->node = node;
     s->fd = -1;
     s->tty_fd = -1;
+    s->last_active = -1;
     if (stat(node, &st) != 0 || !S_ISCHR(st.st_mode)) {
         fprintf(stderr, "seat: %s is not a device node\n", node);
         free(s);
@@ -266,23 +360,10 @@ int x12_seat_open(struct x12_seat **out, const char *node,
     if (logind_attach(s) != 0) {
         // no session, no bus, or logind said no: the root console and
         // container path opens the node itself and claims the master
-        s->fd = open(node, O_RDWR | O_CLOEXEC);
-        if (s->fd < 0) {
-            fprintf(stderr, "seat: cannot open drm node %s: %s\n", node,
-                    strerror(errno));
+        if (own_fd_open(s) != 0) {
             free(s);
             return -1;
         }
-        if (drmSetMaster(s->fd) != 0) {
-            fprintf(stderr,
-                    "seat: no drm master on %s, a session still owns it: "
-                    "%s\n",
-                    node, strerror(errno));
-            close(s->fd);
-            free(s);
-            return -1;
-        }
-        fprintf(stderr, "seat: raw open on %s, master set\n", node);
         vt_attach(s);
     }
     *out = s;
@@ -298,26 +379,12 @@ void x12_seat_pump(struct x12_seat *s) {
     // waiting for, everything else can lag a turn
     if (vt_want_away && s->tty_fd >= 0) {
         vt_want_away = 0;
-        s->paused = 1;
-        drmDropMaster(s->fd);
-        fprintf(stderr, "seat: vt away, master dropped\n");
-        if (s->ops->on_pause) {
-            s->ops->on_pause(s->ud);
-        }
+        seat_do_pause(s);
         ioctl(s->tty_fd, VT_RELDISP, 1);
     }
     if (vt_want_back && s->tty_fd >= 0) {
         vt_want_back = 0;
-        if (s->fd >= 0) {
-            drmSetMaster(s->fd);
-        }
-        s->paused = 0;
-        fprintf(stderr, "seat: vt back, master set\n");
-        // same fd, but the chains died with the pause so the backend
-        // rebuilds exactly like it does on a logind resume
-        if (s->ops->on_resume) {
-            s->ops->on_resume(s->ud, s->fd);
-        }
+        seat_do_resume(s);
         ioctl(s->tty_fd, VT_RELDISP, VT_ACKACQ);
     }
     if (!s->bus) {
@@ -326,6 +393,7 @@ void x12_seat_pump(struct x12_seat *s) {
     // the handlers do the work, one drain empties the queue
     while (sd_bus_process(s->bus, NULL) > 0) {
     }
+    poll_active(s);
 }
 
 void x12_seat_close(struct x12_seat *s) {
