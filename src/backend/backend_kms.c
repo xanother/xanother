@@ -628,11 +628,26 @@ static int kms_init(int argc, char **argv) {
         return -1;
     }
     card_fd = x12_seat_fd(seat);
+    // a dark vt hands the device out paused, give the switch a few
+    // seconds to land before giving up on the screen
+    for (int i = 0; i < 50 && card_fd < 0; i++) {
+        x12_seat_pump(seat);
+        usleep(100000);
+        card_fd = x12_seat_fd(seat);
+    }
+    if (card_fd < 0) {
+        fprintf(stderr,
+                "x12-server: the drm device stays paused, switch to the "
+                "session vt first\n");
+        goto fail;
+    }
 
     // every connected connector claims a crtc and a chain, the heads
     // tile left to right in scan order
     drmModeRes *res = drmModeGetResources(card_fd);
     if (!res) {
+        fprintf(stderr, "x12-server: drm probe failed on %s: %s\n", node,
+                strerror(errno));
         goto fail;
     }
     for (int i = 0; i < res->count_connectors && n_out_slots < X12_OUT_MAX;

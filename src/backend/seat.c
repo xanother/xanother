@@ -185,8 +185,11 @@ static int logind_attach(struct x12_seat *s) {
         fprintf(stderr, "seat: takedevice gave no fd\n");
         goto fail;
     }
-    fprintf(stderr, "seat: session %s holds drm %u:%u\n", s->path, s->major,
-            s->minor);
+    // a device handed out inactive sits on a dark vt until its session
+    // comes back to the front
+    s->paused = inactive ? 1 : 0;
+    fprintf(stderr, "seat: session %s holds drm %u:%u%s\n", s->path, s->major,
+            s->minor, inactive ? " (paused, dark vt)" : "");
     sd_bus_error_free(&err);
 
     // pause/resume arrive as session signals, the filter keeps other
