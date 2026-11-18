@@ -117,10 +117,16 @@ static int on_resume_signal(sd_bus_message *m, void *ud, sd_bus_error *err) {
     if (major != s->major || minor != s->minor || fd < 0) {
         return 0;
     }
+    // same fd ownership dance as at takedevice time: the signal
+    // message reclaims its fd when the pump frees it
+    int fresh = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    if (fresh < 0) {
+        return 0;
+    }
     // the old fd is a dead namespace for gem handles, the fresh one
     // replaces it outright
     int old = s->fd;
-    s->fd = fd;
+    s->fd = fresh;
     s->paused = 0;
     if (old >= 0) {
         close(old);
@@ -178,11 +184,20 @@ static int logind_attach(struct x12_seat *s) {
         fprintf(stderr, "seat: takedevice refused: %s\n", err.message);
         goto fail;
     }
-    r = sd_bus_message_read(m, "hb", &s->fd, &inactive);
+    int raw = -1;
+    r = sd_bus_message_read(m, "hb", &raw, &inactive);
     sd_bus_message_unref(m);
     m = NULL;
-    if (r < 0 || s->fd < 0) {
+    if (r < 0 || raw < 0) {
         fprintf(stderr, "seat: takedevice gave no fd\n");
+        goto fail;
+    }
+    // the message owns the fd it carried and closes it on unref on
+    // some systemd versions, a dup of ours survives every reading of
+    // the rules
+    s->fd = fcntl(raw, F_DUPFD_CLOEXEC, 0);
+    if (s->fd < 0) {
+        fprintf(stderr, "seat: cannot dup the device fd\n");
         goto fail;
     }
     // a device handed out inactive sits on a dark vt until its session
