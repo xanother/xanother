@@ -210,7 +210,11 @@ static int handle_bind(struct x12_conn *c, uint32_t object, const x12_arg *args)
     // a fresh output announces its screen description and joins the
     // presentation feedback fan out
     if (rule->kind == OBJ_OUTPUT) {
-        x12_output_bind(c, id, (int)instance);
+        if (x12_output_bind(c, id, (int)instance) != 0) {
+            x12_conn_error(c, X12_ERROR_CODE_OUT_OF_MEMORY, object);
+            x12_objects_free(&c->objects, id);
+            return 0;
+        }
         return x12_output_send_desc(c, id, (int)instance);
     }
     // a fresh buffer manager announces the formats it composites on

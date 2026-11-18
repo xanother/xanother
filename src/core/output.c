@@ -11,7 +11,7 @@ static struct {
     struct x12_conn *c;
     uint32_t id;
     int slot;
-} bindings[X12_MAX_CLIENTS];
+} bindings[X12_MAX_CLIENTS * X12_MAX_OBJECTS];
 
 static struct x12_output_desc slots[X12_OUTPUT_SLOTS];
 
@@ -51,26 +51,28 @@ int x12_output_count(void) {
     return n;
 }
 
-void x12_output_bind(struct x12_conn *c, uint32_t id, int slot) {
-    for (size_t i = 0; i < X12_MAX_CLIENTS; i++) {
+int x12_output_bind(struct x12_conn *c, uint32_t id, int slot) {
+    for (size_t i = 0; i < sizeof bindings / sizeof bindings[0]; i++) {
         if (bindings[i].c == c && bindings[i].id == id) {
-            return;
+            return 0;
         }
     }
-    for (size_t i = 0; i < X12_MAX_CLIENTS; i++) {
+    for (size_t i = 0; i < sizeof bindings / sizeof bindings[0]; i++) {
         if (bindings[i].c == 0) {
             bindings[i].c = c;
             bindings[i].id = id;
             bindings[i].slot = slot;
-            return;
+            return 0;
         }
     }
-    // no slot left: the binding hears nothing, the client sees silence
-    // instead of a kill
+    // the table covers the whole object budget, so this is a guard,
+    // not a tripwire. refusing beats the old silence where a client
+    // believed its output was bound while nobody would ever hear it
+    return -1;
 }
 
 int x12_output_slot_of(struct x12_conn *c, uint32_t id) {
-    for (size_t i = 0; i < X12_MAX_CLIENTS; i++) {
+    for (size_t i = 0; i < sizeof bindings / sizeof bindings[0]; i++) {
         if (bindings[i].c == c && bindings[i].id == id) {
             return bindings[i].slot;
         }
@@ -79,7 +81,7 @@ int x12_output_slot_of(struct x12_conn *c, uint32_t id) {
 }
 
 void x12_output_release(struct x12_conn *c, uint32_t id) {
-    for (size_t i = 0; i < X12_MAX_CLIENTS; i++) {
+    for (size_t i = 0; i < sizeof bindings / sizeof bindings[0]; i++) {
         if (bindings[i].c == c && bindings[i].id == id) {
             bindings[i].c = 0;
             bindings[i].id = 0;
@@ -88,7 +90,7 @@ void x12_output_release(struct x12_conn *c, uint32_t id) {
 }
 
 void x12_output_unbind(struct x12_conn *c) {
-    for (size_t i = 0; i < X12_MAX_CLIENTS; i++) {
+    for (size_t i = 0; i < sizeof bindings / sizeof bindings[0]; i++) {
         if (bindings[i].c == c) {
             bindings[i].c = 0;
             bindings[i].id = 0;
@@ -134,7 +136,7 @@ int x12_output_send_desc(struct x12_conn *c, uint32_t id, int slot) {
 }
 
 void x12_output_refresh(int slot) {
-    for (size_t i = 0; i < X12_MAX_CLIENTS; i++) {
+    for (size_t i = 0; i < sizeof bindings / sizeof bindings[0]; i++) {
         if (bindings[i].c && bindings[i].slot == slot) {
             x12_output_send_desc(bindings[i].c, bindings[i].id, slot);
         }
@@ -145,7 +147,7 @@ void x12_output_refresh(int slot) {
 static void fan_out(int slot, const char *event, const x12_arg *a, int n_args,
                     uint64_t ns) {
     const x12_iface_desc *out = x12_iface_find("x12_output");
-    for (size_t i = 0; i < X12_MAX_CLIENTS; i++) {
+    for (size_t i = 0; i < sizeof bindings / sizeof bindings[0]; i++) {
         if (!bindings[i].c || bindings[i].slot != slot) {
             continue;
         }

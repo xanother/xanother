@@ -35,8 +35,9 @@ int x12_output_describe(int slot, struct x12_output_desc *d);
 int x12_output_count(void);
 
 // the registry bind and the teardown paths: release frees one binding,
-// unbind drops everything a dying connection held
-void x12_output_bind(struct x12_conn *c, uint32_t id, int slot);
+// unbind drops everything a dying connection held. bind refuses when
+// the table is full so the client hears about it
+int x12_output_bind(struct x12_conn *c, uint32_t id, int slot);
 void x12_output_release(struct x12_conn *c, uint32_t id);
 void x12_output_unbind(struct x12_conn *c);
 
