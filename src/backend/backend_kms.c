@@ -28,6 +28,7 @@
 
 #include "backend.h"
 #include "output.h"
+#include "seat.h"
 
 // one dumb buffer of the chain: dumb buffers map through the drm fd
 // itself so a display only driver like vkms works without any gl stack
@@ -75,7 +76,11 @@ struct output {
 #define X12_OUT_MAX 4
 
 static int card_fd = -1;
+static struct x12_seat *seat;
+static int seat_paused;
 static drmEventContext evctx;
+
+static void recheck_connectors(void);
 static struct output outs[X12_OUT_MAX];
 static int n_out_slots;
 static uint32_t used_crtcs[32];
@@ -330,6 +335,81 @@ static int out_rearm(int oi) {
     return 1;
 }
 
+// the seat pulls the master away around vt switches. pause drops the
+// per fd state (gem handles die with the fd), the sessions riding a
+// scanout get the replacement credit their frames never landed
+static void kms_seat_pause(void *ud) {
+    (void)ud;
+    seat_paused = 1;
+    for (int i = 0; i < n_out_slots; i++) {
+        struct output *o = &outs[i];
+        if (o->conn_id == 0) {
+            continue;
+        }
+        for (int k = 0; k < 2; k++) {
+            dumb_free(card_fd, &o->slot[k]);
+        }
+        o->front = 0;
+        o->pending = -1;
+    }
+    for (int i = 0; i < 2; i++) {
+        if (so[i].in_use) {
+            push_event(X12_SCANOUT_REPLACED, so[i].cookie, now_ns(), so[i].out);
+            so_free(&so[i]);
+            for (int k = 0; k < X12_OUT_MAX; k++) {
+                if (so_front[k] == &so[i]) {
+                    so_front[k] = 0;
+                }
+            }
+        }
+    }
+}
+
+// resume rebuild: the chain is per fd state and the fd just changed,
+// the mode and the slot stay where they were. a refused crtc means
+// the head is gone for real and the hotplug path owns it from here
+static void out_rebuild(int oi) {
+    struct output *o = &outs[oi];
+    uint32_t w = o->mode.hdisplay, h = o->mode.vdisplay;
+    for (int i = 0; i < 2; i++) {
+        if (dumb_alloc(card_fd, &o->slot[i], w, h) != 0) {
+            for (int k = 0; k < i; k++) {
+                dumb_free(card_fd, &o->slot[k]);
+            }
+            out_take_down(o);
+            return;
+        }
+        fill_black(&o->slot[i], w, h);
+    }
+    if (drmModeSetCrtc(card_fd, o->crtc_id, o->slot[0].fb_id, 0, 0,
+                       &o->conn_id, 1, &o->mode) != 0) {
+        fprintf(stderr, "kms backend: resume refused on %s: %s\n", o->name,
+                strerror(errno));
+        for (int k = 0; k < 2; k++) {
+            dumb_free(card_fd, &o->slot[k]);
+        }
+        out_take_down(o);
+        return;
+    }
+    o->front = 0;
+    o->pending = -1;
+    fprintf(stderr, "kms backend: output %d (%s) back on its feet\n", oi,
+            o->name);
+}
+
+static void kms_seat_resume(void *ud, int fd) {
+    (void)ud;
+    card_fd = fd;
+    seat_paused = 0;
+    for (int i = 0; i < n_out_slots; i++) {
+        if (outs[i].conn_id != 0) {
+            out_rebuild(i);
+        }
+    }
+    // cables may have moved while the vt was dark
+    recheck_connectors();
+}
+
 // claims a free slot for one connected connector and arms its chain.
 // returns the slot or -1 when nothing is free or usable
 static int output_bring_up(drmModeRes *res, uint32_t conn_id) {
@@ -534,21 +614,14 @@ static int kms_init(int argc, char **argv) {
         fprintf(stderr, "x12-server: --kms needs a drm node\n");
         return -1;
     }
-    card_fd = open(node, O_RDWR | O_CLOEXEC);
-    if (card_fd < 0) {
-        fprintf(stderr, "x12-server: cannot open drm node %s: %s\n", node,
-                strerror(errno));
+    static const struct x12_seat_ops seat_ops = {
+        .on_pause = kms_seat_pause,
+        .on_resume = kms_seat_resume,
+    };
+    if (x12_seat_open(&seat, node, &seat_ops, NULL) != 0) {
         return -1;
     }
-    if (drmSetMaster(card_fd) != 0) {
-        fprintf(stderr,
-                "x12-server: no drm master on %s, a session still owns it: "
-                "%s\n",
-                node, strerror(errno));
-        close(card_fd);
-        card_fd = -1;
-        return -1;
-    }
+    card_fd = x12_seat_fd(seat);
 
     // every connected connector claims a crtc and a chain, the heads
     // tile left to right in scan order
@@ -647,8 +720,8 @@ static void kms_destroy(void) {
     for (int i = 0; i < X12_OUT_MAX; i++) {
         so_front[i] = 0;
     }
-    drmDropMaster(card_fd);
-    close(card_fd);
+    x12_seat_close(seat);
+    seat = NULL;
     card_fd = -1;
 }
 
@@ -674,6 +747,11 @@ static void write_ppm(const char *path, const uint32_t *fb, uint32_t w,
 
 static void kms_present(const uint32_t *fb, const struct x12_rect *rects,
                         int n_rects) {
+    if (seat_paused) {
+        // the master is away, the next present after the resume
+        // rebuild carries the frame
+        return;
+    }
     uint32_t cw = 0, ch = 0;
     x12_kms_bbox(&cw, &ch);
     int flipped = 0;
@@ -992,6 +1070,12 @@ static int kms_output_poll(struct x12_output_event *ev) {
 }
 
 static void kms_pump(void) {
+    // the seat drains its signals first: a pause may land here and
+    // the rest of the turn must stay off the fd
+    x12_seat_pump(seat);
+    if (seat_paused) {
+        return;
+    }
     // flip completions land here every loop turn and free the chains,
     // cable moves arrive on the udev monitor next to them
     drain_flip_events();
@@ -1003,6 +1087,11 @@ static int kms_halt_requested(void) {
 }
 
 static int kms_scanout(const struct x12_scanout_req *req) {
+    if (seat_paused) {
+        // 0 means the caller composites this round, which is exactly
+        // what a dark vt wants
+        return 0;
+    }
     if (!req || req->dmabuf_fd < 0) {
         return 0;
     }

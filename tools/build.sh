@@ -18,8 +18,8 @@ CFLAGS="-std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -I src/wire -I src/core -I 
 # system headers hide behind pkg-config on some machines - ask for the
 # gles3 set first and fall back to gles2, no pkg-config at all just
 # leaves the default include paths
-SYS_CFLAGS=$(pkg-config --cflags libdrm xkbcommon egl glesv3 2>/dev/null || \
-    pkg-config --cflags libdrm xkbcommon egl glesv2 2>/dev/null || true)
+SYS_CFLAGS=$(pkg-config --cflags libdrm libsystemd xkbcommon egl glesv3 2>/dev/null || \
+    pkg-config --cflags libdrm libsystemd xkbcommon egl glesv2 2>/dev/null || true)
 
 gcc $CFLAGS $SYS_CFLAGS -o build/x12-server \
     src/server/main.c \
@@ -40,9 +40,10 @@ gcc $CFLAGS $SYS_CFLAGS -o build/x12-server \
     src/render/cpu.c \
     src/render/gpu.c \
     src/backend/backend_headless.c src/backend/backend_kms.c \
+    src/backend/seat.c \
     src/wire/x12_wire.c \
     build/gen/x12_tables.c \
-    -lxkbcommon -ldl -ldrm -ludev -lssl -lcrypto -lz
+    -lxkbcommon -ldl -ldrm -ludev -lsystemd -lssl -lcrypto -lz
 
 gcc $CFLAGS -o build/c_roundtrip \
     tests/c_roundtrip.c \

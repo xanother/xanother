@@ -1,0 +1,246 @@
+// Copyright (c) lezginskiy <xanother-x12@proton.me>
+// SPDX-License-Identifier: MIT
+
+// seat plumbing: logind takes the device under our session and pokes
+// us with pause/resume around vt switches, the raw fallback keeps the
+// old open+setmaster path alive for root consoles and containers
+
+#include "seat.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <unistd.h>
+
+#include <systemd/sd-bus.h>
+#include <systemd/sd-login.h>
+#include <xf86drm.h>
+
+struct x12_seat {
+    const struct x12_seat_ops *ops;
+    void *ud;
+    int fd;
+    int paused;
+    int controlled;
+    uint32_t major, minor;
+
+    sd_bus *bus;
+    char *path;
+    sd_bus_slot *pause_slot, *resume_slot;
+};
+
+static int on_pause_signal(sd_bus_message *m, void *ud, sd_bus_error *err) {
+    struct x12_seat *s = ud;
+    uint32_t major = 0, minor = 0;
+    const char *type = NULL;
+    (void)err;
+    if (sd_bus_message_read(m, "uus", &major, &minor, &type) < 0) {
+        return 0;
+    }
+    if (major != s->major || minor != s->minor) {
+        return 0;
+    }
+    // "gone" is the device disappearing for good, "pause" is the vt
+    // switch dance: either way the fd goes quiet under us
+    s->paused = 1;
+    drmDropMaster(s->fd);
+    if (s->ops->on_pause) {
+        s->ops->on_pause(s->ud);
+    }
+    // the pause is only complete once we say so
+    sd_bus_call_method(s->bus, "org.freedesktop.login1", s->path,
+                       "org.freedesktop.login1.Session", "PauseDeviceComplete",
+                       NULL, NULL, "uu", major, minor);
+    return 0;
+}
+
+static int on_resume_signal(sd_bus_message *m, void *ud, sd_bus_error *err) {
+    struct x12_seat *s = ud;
+    uint32_t major = 0, minor = 0;
+    int fd = -1;
+    (void)err;
+    if (sd_bus_message_read(m, "uh", &major, &minor, &fd) < 0) {
+        return 0;
+    }
+    if (major != s->major || minor != s->minor || fd < 0) {
+        return 0;
+    }
+    // the old fd is a dead namespace for gem handles, the fresh one
+    // replaces it outright
+    int old = s->fd;
+    s->fd = fd;
+    s->paused = 0;
+    if (old >= 0) {
+        close(old);
+    }
+    if (s->ops->on_resume) {
+        s->ops->on_resume(s->ud, fd);
+    }
+    return 0;
+}
+
+// the session path is what loginctl prints as the session id, the
+// encode keeps odd ids from breaking the object path
+static int logind_attach(struct x12_seat *s) {
+    sd_bus_error err = SD_BUS_ERROR_NULL;
+    sd_bus_message *m = NULL;
+    char *sid = NULL;
+    int r, inactive = 0;
+
+    if (sd_pid_get_session(0, &sid) < 0) {
+        return -1;
+    }
+    if (sd_bus_open_system(&s->bus) < 0) {
+        free(sid);
+        return -1;
+    }
+    if (sd_bus_path_encode("session", sid, &s->path) < 0) {
+        free(sid);
+        goto fail;
+    }
+    // control before devices, logind refuses takedevice otherwise
+    r = sd_bus_call_method(s->bus, "org.freedesktop.login1", s->path,
+                           "org.freedesktop.login1.Session", "TakeControl",
+                           &err, NULL, "b", 0);
+    if (r < 0) {
+        fprintf(stderr, "seat: takecontrol refused: %s\n", err.message);
+        free(sid);
+        goto fail;
+    }
+    s->controlled = 1;
+    r = sd_bus_call_method(s->bus, "org.freedesktop.login1", s->path,
+                           "org.freedesktop.login1.Session", "TakeDevice",
+                           &err, &m, "uu", s->major, s->minor);
+    if (r < 0) {
+        fprintf(stderr, "seat: takedevice refused: %s\n", err.message);
+        free(sid);
+        goto fail;
+    }
+    r = sd_bus_message_read(m, "hb", &s->fd, &inactive);
+    sd_bus_message_unref(m);
+    if (r < 0 || s->fd < 0) {
+        free(sid);
+        goto fail;
+    }
+    fprintf(stderr, "seat: session %s holds drm %u:%u\n", sid, s->major,
+            s->minor);
+    free(sid);
+    sd_bus_error_free(&err);
+
+    // pause/resume arrive as session signals, the filter keeps other
+    // sessions off our plate
+    char match[512];
+    snprintf(match, sizeof match,
+             "type='signal',sender='org.freedesktop.login1',path='%s',"
+             "interface='org.freedesktop.login1.Session',member='PauseDevice'",
+             s->path);
+    sd_bus_add_match(s->bus, &s->pause_slot, match, on_pause_signal, s);
+    snprintf(match, sizeof match,
+             "type='signal',sender='org.freedesktop.login1',path='%s',"
+             "interface='org.freedesktop.login1.Session',member='ResumeDevice'",
+             s->path);
+    sd_bus_add_match(s->bus, &s->resume_slot, match, on_resume_signal, s);
+
+    // register the session type so loginctl shows a real x session.
+    // best effort: older logind refuses the switch and that is fine
+    sd_bus_call_method(s->bus, "org.freedesktop.login1", s->path,
+                       "org.freedesktop.login1.Session", "SetType", NULL,
+                       NULL, "s", "x11");
+    return 0;
+
+fail:
+    sd_bus_error_free(&err);
+    if (s->controlled) {
+        sd_bus_call_method(s->bus, "org.freedesktop.login1", s->path,
+                           "org.freedesktop.login1.Session", "ReleaseControl",
+                           NULL, NULL, NULL);
+        s->controlled = 0;
+    }
+    free(s->path);
+    s->path = NULL;
+    sd_bus_unref(s->bus);
+    s->bus = NULL;
+    return -1;
+}
+
+int x12_seat_open(struct x12_seat **out, const char *node,
+                  const struct x12_seat_ops *ops, void *ud) {
+    struct stat st;
+    struct x12_seat *s = calloc(1, sizeof *s);
+    if (!s) {
+        return -1;
+    }
+    s->ops = ops;
+    s->ud = ud;
+    s->fd = -1;
+    if (stat(node, &st) != 0 || !S_ISCHR(st.st_mode)) {
+        fprintf(stderr, "seat: %s is not a device node\n", node);
+        free(s);
+        return -1;
+    }
+    s->major = major(st.st_rdev);
+    s->minor = minor(st.st_rdev);
+
+    if (logind_attach(s) != 0) {
+        // no session, no bus, or logind said no: the root console and
+        // container path opens the node itself and claims the master
+        s->fd = open(node, O_RDWR | O_CLOEXEC);
+        if (s->fd < 0) {
+            fprintf(stderr, "seat: cannot open drm node %s: %s\n", node,
+                    strerror(errno));
+            free(s);
+            return -1;
+        }
+        if (drmSetMaster(s->fd) != 0) {
+            fprintf(stderr,
+                    "seat: no drm master on %s, a session still owns it: "
+                    "%s\n",
+                    node, strerror(errno));
+            close(s->fd);
+            free(s);
+            return -1;
+        }
+    }
+    *out = s;
+    return 0;
+}
+
+int x12_seat_fd(struct x12_seat *s) {
+    return s->paused ? -1 : s->fd;
+}
+
+void x12_seat_pump(struct x12_seat *s) {
+    if (!s->bus) {
+        return;
+    }
+    // the handlers do the work, one drain empties the queue
+    while (sd_bus_process(s->bus, NULL) > 0) {
+    }
+}
+
+void x12_seat_close(struct x12_seat *s) {
+    if (!s) {
+        return;
+    }
+    if (s->bus && s->controlled) {
+        sd_bus_call_method(s->bus, "org.freedesktop.login1", s->path,
+                           "org.freedesktop.login1.Session", "ReleaseDevice",
+                           NULL, NULL, "uu", s->major, s->minor);
+        sd_bus_call_method(s->bus, "org.freedesktop.login1", s->path,
+                           "org.freedesktop.login1.Session", "ReleaseControl",
+                           NULL, NULL, NULL);
+    }
+    if (s->fd >= 0) {
+        drmDropMaster(s->fd);
+        close(s->fd);
+    }
+    sd_bus_slot_unref(s->pause_slot);
+    sd_bus_slot_unref(s->resume_slot);
+    sd_bus_unref(s->bus);
+    free(s->path);
+    free(s);
+}
