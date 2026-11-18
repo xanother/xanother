@@ -96,6 +96,7 @@ static int on_pause_signal(sd_bus_message *m, void *ud, sd_bus_error *err) {
     // switch dance: either way the fd goes quiet under us
     s->paused = 1;
     drmDropMaster(s->fd);
+    fprintf(stderr, "seat: device paused, master dropped\n");
     if (s->ops->on_pause) {
         s->ops->on_pause(s->ud);
     }
@@ -125,6 +126,7 @@ static int on_resume_signal(sd_bus_message *m, void *ud, sd_bus_error *err) {
     if (old >= 0) {
         close(old);
     }
+    fprintf(stderr, "seat: device resumed on a fresh fd\n");
     if (s->ops->on_resume) {
         s->ops->on_resume(s->ud, fd);
     }
@@ -140,13 +142,16 @@ static int logind_attach(struct x12_seat *s) {
     int r, inactive = 0;
 
     if (sd_pid_get_session(0, &sid) < 0) {
+        fprintf(stderr, "seat: no logind session here, raw open it is\n");
         return -1;
     }
     if (sd_bus_open_system(&s->bus) < 0) {
+        fprintf(stderr, "seat: no system bus, raw open it is\n");
         free(sid);
         return -1;
     }
     if (sd_bus_path_encode("session", sid, &s->path) < 0) {
+        fprintf(stderr, "seat: session %s encodes badly\n", sid);
         free(sid);
         goto fail;
     }
@@ -253,6 +258,7 @@ int x12_seat_open(struct x12_seat **out, const char *node,
             free(s);
             return -1;
         }
+        fprintf(stderr, "seat: raw open on %s, master set\n", node);
         vt_attach(s);
     }
     *out = s;
@@ -270,6 +276,7 @@ void x12_seat_pump(struct x12_seat *s) {
         vt_want_away = 0;
         s->paused = 1;
         drmDropMaster(s->fd);
+        fprintf(stderr, "seat: vt away, master dropped\n");
         if (s->ops->on_pause) {
             s->ops->on_pause(s->ud);
         }
@@ -281,6 +288,7 @@ void x12_seat_pump(struct x12_seat *s) {
             drmSetMaster(s->fd);
         }
         s->paused = 0;
+        fprintf(stderr, "seat: vt back, master set\n");
         // same fd, but the chains died with the pause so the backend
         // rebuilds exactly like it does on a logind resume
         if (s->ops->on_resume) {
