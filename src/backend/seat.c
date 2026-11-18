@@ -9,11 +9,14 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <sys/vt.h>
 #include <unistd.h>
 
 #include <systemd/sd-bus.h>
@@ -26,12 +29,57 @@ struct x12_seat {
     int fd;
     int paused;
     int controlled;
+    int tty_fd;
     uint32_t major, minor;
 
     sd_bus *bus;
     char *path;
     sd_bus_slot *pause_slot, *resume_slot;
 };
+
+// the vt process mode talks in signals, so all they do is raise a flag
+// for the pump to pick up
+static volatile sig_atomic_t vt_want_away, vt_want_back;
+
+static void on_vt_away(int sig) {
+    (void)sig;
+    vt_want_away = 1;
+}
+
+static void on_vt_back(int sig) {
+    (void)sig;
+    vt_want_back = 1;
+}
+
+// without logind the vt dance is ours: process mode makes the kernel
+// ping us before it switches the screen away and when it hands the
+// screen back. no controlling tty (a socket session, a container) =
+// nothing to hold and nothing to do
+static void vt_attach(struct x12_seat *s) {
+    struct vt_mode vm;
+    struct sigaction sa;
+
+    s->tty_fd = open("/dev/tty", O_RDWR | O_CLOEXEC);
+    if (s->tty_fd < 0) {
+        return;
+    }
+    memset(&vm, 0, sizeof vm);
+    vm.mode = VT_PROCESS;
+    vm.relsig = SIGUSR1;
+    vm.acqsig = SIGUSR2;
+    if (ioctl(s->tty_fd, VT_SETMODE, &vm) != 0) {
+        // not a virtual terminal, the pts sessions end up here
+        close(s->tty_fd);
+        s->tty_fd = -1;
+        return;
+    }
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_vt_away;
+    sigaction(SIGUSR1, &sa, NULL);
+    sa.sa_handler = on_vt_back;
+    sigaction(SIGUSR2, &sa, NULL);
+    fprintf(stderr, "seat: holding the vt around switches\n");
+}
 
 static int on_pause_signal(sd_bus_message *m, void *ud, sd_bus_error *err) {
     struct x12_seat *s = ud;
@@ -177,6 +225,7 @@ int x12_seat_open(struct x12_seat **out, const char *node,
     s->ops = ops;
     s->ud = ud;
     s->fd = -1;
+    s->tty_fd = -1;
     if (stat(node, &st) != 0 || !S_ISCHR(st.st_mode)) {
         fprintf(stderr, "seat: %s is not a device node\n", node);
         free(s);
@@ -204,6 +253,7 @@ int x12_seat_open(struct x12_seat **out, const char *node,
             free(s);
             return -1;
         }
+        vt_attach(s);
     }
     *out = s;
     return 0;
@@ -214,6 +264,30 @@ int x12_seat_fd(struct x12_seat *s) {
 }
 
 void x12_seat_pump(struct x12_seat *s) {
+    // the vt flags first: releasing the screen is what the kernel is
+    // waiting for, everything else can lag a turn
+    if (vt_want_away && s->tty_fd >= 0) {
+        vt_want_away = 0;
+        s->paused = 1;
+        drmDropMaster(s->fd);
+        if (s->ops->on_pause) {
+            s->ops->on_pause(s->ud);
+        }
+        ioctl(s->tty_fd, VT_RELDISP, 1);
+    }
+    if (vt_want_back && s->tty_fd >= 0) {
+        vt_want_back = 0;
+        if (s->fd >= 0) {
+            drmSetMaster(s->fd);
+        }
+        s->paused = 0;
+        // same fd, but the chains died with the pause so the backend
+        // rebuilds exactly like it does on a logind resume
+        if (s->ops->on_resume) {
+            s->ops->on_resume(s->ud, s->fd);
+        }
+        ioctl(s->tty_fd, VT_RELDISP, VT_ACKACQ);
+    }
     if (!s->bus) {
         return;
     }
@@ -233,6 +307,15 @@ void x12_seat_close(struct x12_seat *s) {
         sd_bus_call_method(s->bus, "org.freedesktop.login1", s->path,
                            "org.freedesktop.login1.Session", "ReleaseControl",
                            NULL, NULL, NULL);
+    }
+    if (s->tty_fd >= 0) {
+        // hand the vt back to the kernel before leaving, a stuck
+        // process mode would freeze the console switching forever
+        struct vt_mode vm;
+        memset(&vm, 0, sizeof vm);
+        vm.mode = VT_AUTO;
+        ioctl(s->tty_fd, VT_SETMODE, &vm);
+        close(s->tty_fd);
     }
     if (s->fd >= 0) {
         drmDropMaster(s->fd);
