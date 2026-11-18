@@ -8,12 +8,14 @@
 #include <limits.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <poll.h>
 #include <arpa/inet.h>
 #include <openssl/x509_vfy.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -24,6 +26,45 @@
 // the kernel truncates silently at its own limit, so parsing has to
 // refuse anything that would not survive the bind round trip
 enum { X12_SUN_PATH_MAX = sizeof(((struct sockaddr_un *)0)->sun_path) };
+
+// a blackholed route keeps connect() in the kernel until the tcp
+// give-up timer, so the dial gets its own deadline instead of hanging
+enum { X12_DIAL_TIMEOUT_MS = 10000 };
+
+static int
+connect_deadline(int s, const struct sockaddr *sa, socklen_t len)
+{
+    struct pollfd pfd;
+    int fl = fcntl(s, F_GETFL, 0);
+    if (fl < 0 || fcntl(s, F_SETFL, fl | O_NONBLOCK) != 0) {
+        return -1;
+    }
+    int rc = connect(s, sa, len);
+    if (rc != 0 && errno == EINPROGRESS) {
+        pfd.fd = s;
+        pfd.events = POLLOUT;
+        int pr = poll(&pfd, 1, X12_DIAL_TIMEOUT_MS);
+        if (pr == 1) {
+            int err = 0;
+            socklen_t elen = sizeof err;
+            if (getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &elen) != 0 || err != 0) {
+                errno = err ? err : EIO;
+                rc = -1;
+            } else {
+                rc = 0;
+            }
+        } else {
+            // a poll timeout leaves no errno of its own
+            errno = pr == 0 ? ETIMEDOUT : errno;
+            rc = -1;
+        }
+    }
+    // the stream above wants a blocking socket back
+    if (fcntl(s, F_SETFL, fl) != 0) {
+        rc = -1;
+    }
+    return rc;
+}
 
 static int
 parse_hostport(const char *s, struct x12_net_addr *out)
@@ -263,7 +304,7 @@ x12_net_connect(const struct x12_net_addr *a, void **tls_out)
         if (s < 0) {
             continue;
         }
-        if (connect(s, it->ai_addr, it->ai_addrlen) == 0) {
+        if (connect_deadline(s, it->ai_addr, it->ai_addrlen) == 0) {
             break;
         }
         close(s);
@@ -335,12 +376,24 @@ x12_net_connect(const struct x12_net_addr *a, void **tls_out)
 #endif
             }
         }
+        // the handshake rides the same deadline - a middlebox that
+        // swallows the session must not hang the dial forever. the
+        // stream above gets blocking sockets without timeouts again
+        struct timeval tv;
+        tv.tv_sec = X12_DIAL_TIMEOUT_MS / 1000;
+        tv.tv_usec = 0;
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
         if (SSL_connect(ssl) != 1) {
             tls_log("tls connect handshake failed");
             SSL_free(ssl);
             close(s);
             return -1;
         }
+        tv.tv_sec = 0;
+        tv.tv_usec = 0;
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
         *tls_out = ssl;
     }
     return s;
