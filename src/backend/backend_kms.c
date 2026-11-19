@@ -1,4 +1,5 @@
 // Copyright (c) lezginskiy <xanother-x12@proton.me>
+// Copyright (c) fluent1s (akemi) <m1st1kad3ad1y@gmail.com>
 // SPDX-License-Identifier: MIT
 
 // kms backend: drives real screens over dumb buffer chains, one chain
@@ -60,6 +61,8 @@ struct output {
     uint32_t magic;  // flip event tag
     int live;
     uint32_t conn_id, crtc_id;
+    int crtc_idx;      // position in the drm resource list
+    uint32_t plane_id; // primary plane feeding the crtc, 0 = legacy only
     drmModeModeInfo mode;
     int32_t x, y;  // position on the global canvas
     uint32_t mm_w, mm_h;
@@ -72,6 +75,8 @@ struct output {
 
 #define FLIP_MAGIC_OUT 0x4f555450u
 #define FLIP_MAGIC_SO 0x5343414eu
+// a flip event for the gpu present pair, the tag names its kind
+#define FLIP_MAGIC_PRES 0x50524553u
 
 #define X12_OUT_MAX 4
 
@@ -93,6 +98,25 @@ static struct so_fb so[2];
 static struct so_fb *so_front[X12_OUT_MAX];
 static struct x12_scanout_event so_evq[8];
 static int so_evq_n;
+
+// the gpu present pair: atomic flips armed when the driver takes them,
+// the two frame slots mirror the two scanout bos the compositor folds
+// into
+static int atomic_ok;
+static uint32_t pres_fb[2];
+static int pres_fd[2] = { -1, -1 };
+static int pres_front = -1, pres_pending = -1;
+static struct pres_tag {
+    uint32_t magic;
+    int slot;
+    int left; // heads still to land on this tag
+} pres_tag;
+static struct x12_present_event pres_evq[8];
+static int pres_evq_n;
+// cached property ids of the primary plane, looked up once per device
+static struct {
+    uint32_t fb_id, crtc_id, src_x, src_y, src_w, src_h;
+} pl_props;
 
 // hotplug: udev watches the drm subsystem, the kernel fd carries no in
 // band message when a cable moves
@@ -415,6 +439,215 @@ static void kms_seat_resume(void *ud, int fd) {
 
 // claims a free slot for one connected connector and arms its chain.
 // returns the slot or -1 when nothing is free or usable
+// property id of a named object property, 0 when the object has none
+static int prop_get(uint32_t obj_type, uint32_t obj, const char *name,
+                    uint64_t *out);
+
+static uint32_t obj_prop(uint32_t obj_type, uint32_t obj, const char *name) {
+    drmModeObjectPropertiesPtr p =
+        drmModeObjectGetProperties(card_fd, obj, obj_type);
+    if (!p) {
+        return 0;
+    }
+    uint32_t id = 0;
+    for (uint32_t i = 0; i < p->count_props && !id; i++) {
+        drmModePropertyPtr pr = drmModeGetProperty(card_fd, p->props[i]);
+        if (pr) {
+            if (strcmp(pr->name, name) == 0) {
+                id = pr->prop_id;
+            }
+            drmModeFreeProperty(pr);
+        }
+    }
+    drmModeFreeObjectProperties(p);
+    return id;
+}
+
+// the primary plane feeding a crtc: the type property names it, and a
+// plane already bound to the crtc wins when the type stays hidden
+static uint32_t pick_plane(const struct output *o) {
+    drmModePlaneRes *pr = drmModeGetPlaneResources(card_fd);
+    if (!pr) {
+        return 0;
+    }
+    uint32_t id = 0, bound = 0;
+    for (uint32_t i = 0; i < pr->count_planes && !id; i++) {
+        drmModePlane *pl = drmModeGetPlane(card_fd, pr->planes[i]);
+        if (!pl) {
+            continue;
+        }
+        if (pl->possible_crtcs & (1u << o->crtc_idx)) {
+            uint64_t t = 0;
+            if (prop_get(DRM_MODE_OBJECT_PLANE, pl->plane_id, "type", &t) == 0) {
+                if (t == DRM_PLANE_TYPE_PRIMARY) {
+                    id = pl->plane_id;
+                }
+            } else if (pl->crtc_id == o->crtc_id) {
+                bound = pl->plane_id;
+            }
+        }
+        drmModeFreePlane(pl);
+    }
+    drmModeFreePlaneResources(pr);
+    return id ? id : bound;
+}
+
+// the six property ids the atomic commits address by, one lookup
+static void cache_plane_props(uint32_t plane_id) {
+    if (pl_props.fb_id) {
+        return;
+    }
+    pl_props.fb_id = obj_prop(DRM_MODE_OBJECT_PLANE, plane_id, "FB_ID");
+    pl_props.crtc_id = obj_prop(DRM_MODE_OBJECT_PLANE, plane_id, "CRTC_ID");
+    pl_props.src_x = obj_prop(DRM_MODE_OBJECT_PLANE, plane_id, "SRC_X");
+    pl_props.src_y = obj_prop(DRM_MODE_OBJECT_PLANE, plane_id, "SRC_Y");
+    pl_props.src_w = obj_prop(DRM_MODE_OBJECT_PLANE, plane_id, "SRC_W");
+    pl_props.src_h = obj_prop(DRM_MODE_OBJECT_PLANE, plane_id, "SRC_H");
+}
+
+// turns one gpu frame slot into an fb on this device, the gem handle is
+// dropped right after the wrap so only the fb keeps the buffer alive
+static int pres_import(const struct x12_gpu_frame *f) {
+    int slot = f->slot;
+    if (pres_fd[slot] == f->dmabuf_fd) {
+        return 1;
+    }
+    if (pres_fb[slot]) {
+        drmModeRmFB(card_fd, pres_fb[slot]);
+        pres_fb[slot] = 0;
+    }
+    uint32_t handle = 0;
+    if (drmPrimeFDToHandle(card_fd, f->dmabuf_fd, &handle) != 0) {
+        return 0;
+    }
+    uint32_t handles[4] = { handle, 0, 0, 0 };
+    uint32_t pitches[4] = { f->stride, 0, 0, 0 };
+    uint32_t offsets[4] = { 0, 0, 0, 0 };
+    uint32_t fb = 0;
+    int rc;
+    if (f->modifier && f->modifier != DRM_FORMAT_MOD_INVALID) {
+        uint64_t mods[4] = { f->modifier, 0, 0, 0 };
+        rc = drmModeAddFB2WithModifiers(card_fd, f->width, f->height,
+                                        f->format, handles, pitches,
+                                        offsets, mods, &fb,
+                                        DRM_MODE_FB_MODIFIERS);
+    } else {
+        rc = drmModeAddFB2(card_fd, f->width, f->height, f->format,
+                           handles, pitches, offsets, &fb, 0);
+    }
+    struct drm_gem_close gc = { .handle = handle };
+    drmIoctl(card_fd, DRM_IOCTL_GEM_CLOSE, &gc);
+    if (rc != 0) {
+        return 0;
+    }
+    pres_fb[slot] = fb;
+    pres_fd[slot] = f->dmabuf_fd;
+    return 1;
+}
+
+// drains flip events until the pending present landed or the device
+// went quiet, a stuck flip must not wedge the next one
+static void pres_wait(void) {
+    for (int spin = 0; pres_pending >= 0 && spin < 64; spin++) {
+        struct pollfd p = { .fd = card_fd, .events = POLLIN };
+        if (poll(&p, 1, 100) <= 0) {
+            break;
+        }
+        if (drmHandleEvent(card_fd, &evctx) != 0) {
+            break;
+        }
+    }
+    pres_pending = -1;
+}
+
+// the direct gpu path: one atomic commit points every dirty head at the
+// finished frame slot. untouched heads keep their plane, 0 falls back
+static int kms_present_gpu(const struct x12_gpu_frame *frame,
+                           const struct x12_rect *rects, int n_rects) {
+    if (!atomic_ok || !frame || frame->slot < 0 || frame->slot > 1) {
+        return 0;
+    }
+    if (!pres_import(frame)) {
+        return 0;
+    }
+    if (pres_pending >= 0) {
+        pres_wait();
+        if (pres_pending >= 0) {
+            return 0;
+        }
+    }
+    drmModeAtomicReqPtr rq = drmModeAtomicAlloc();
+    if (!rq) {
+        return 0;
+    }
+    int heads = 0;
+    for (int oi = 0; oi < n_out_slots; oi++) {
+        struct output *o = &outs[oi];
+        if (!o->live || !o->plane_id || !pl_props.fb_id) {
+            continue;
+        }
+        int dirty = 0;
+        for (int k = 0; k < n_rects && !dirty; k++) {
+            int64_t x0 = rects[k].x > o->x ? rects[k].x : o->x;
+            int64_t y0 = rects[k].y > o->y ? rects[k].y : o->y;
+            int64_t x1 = rects[k].x + (int64_t)rects[k].w;
+            int64_t y1 = rects[k].y + (int64_t)rects[k].h;
+            if (x1 > o->x + (int64_t)o->mode.hdisplay) {
+                x1 = o->x + (int64_t)o->mode.hdisplay;
+            }
+            if (y1 > o->y + (int64_t)o->mode.vdisplay) {
+                y1 = o->y + (int64_t)o->mode.vdisplay;
+            }
+            dirty = x1 > x0 && y1 > y0;
+        }
+        if (!dirty) {
+            continue;
+        }
+        drmModeAtomicAddProperty(rq, o->plane_id, pl_props.fb_id,
+                                 pres_fb[frame->slot]);
+        drmModeAtomicAddProperty(rq, o->plane_id, pl_props.src_x,
+                                 (uint64_t)o->x << 16);
+        drmModeAtomicAddProperty(rq, o->plane_id, pl_props.src_y,
+                                 (uint64_t)o->y << 16);
+        drmModeAtomicAddProperty(rq, o->plane_id, pl_props.src_w,
+                                 (uint64_t)o->mode.hdisplay << 16);
+        drmModeAtomicAddProperty(rq, o->plane_id, pl_props.src_h,
+                                 (uint64_t)o->mode.vdisplay << 16);
+        drmModeAtomicAddProperty(rq, o->plane_id, pl_props.crtc_id,
+                                 o->crtc_id);
+        heads++;
+    }
+    if (!heads) {
+        drmModeAtomicFree(rq);
+        return 0;
+    }
+    pres_tag.magic = FLIP_MAGIC_PRES;
+    pres_tag.slot = frame->slot;
+    pres_tag.left = heads;
+    int rc = drmModeAtomicCommit(card_fd, rq,
+                                 DRM_MODE_PAGE_FLIP_EVENT |
+                                     DRM_MODE_ATOMIC_NONBLOCK,
+                                 &pres_tag);
+    drmModeAtomicFree(rq);
+    if (rc != 0) {
+        return 0;
+    }
+    pres_pending = frame->slot;
+    return 1;
+}
+
+static int kms_present_poll(struct x12_present_event *ev) {
+    if (pres_evq_n == 0) {
+        return 0;
+    }
+    *ev = pres_evq[0];
+    for (int i = 1; i < pres_evq_n; i++) {
+        pres_evq[i - 1] = pres_evq[i];
+    }
+    pres_evq_n--;
+    return 1;
+}
+
 static int output_bring_up(drmModeRes *res, uint32_t conn_id) {
     drmModeConnector *conn = drmModeGetConnector(card_fd, conn_id);
     if (!conn) {
@@ -449,6 +682,15 @@ static int output_bring_up(drmModeRes *res, uint32_t conn_id) {
     o->magic = FLIP_MAGIC_OUT;
     o->conn_id = conn_id;
     o->crtc_id = crtc_id;
+    for (int c = 0; c < res->count_crtcs; c++) {
+        if (res->crtcs[c] == crtc_id) {
+            o->crtc_idx = c;
+        }
+    }
+    o->plane_id = pick_plane(o);
+    if (o->plane_id) {
+        cache_plane_props(o->plane_id);
+    }
     o->mode = conn->modes[0];
     o->mm_w = conn->mmWidth;
     o->mm_h = conn->mmHeight;
@@ -531,6 +773,21 @@ static void flip_handler(int fd, unsigned int seq, unsigned int tv_sec,
         return;
     }
     struct so_fb *probe = user;
+    struct pres_tag *pt = user;
+    if (pt->magic == FLIP_MAGIC_PRES) {
+        // one tag fans out to several heads, the last landing reports
+        if (--pt->left > 0) {
+            return;
+        }
+        pres_front = pt->slot;
+        pres_pending = -1;
+        if (pres_evq_n < (int)(sizeof pres_evq / sizeof pres_evq[0])) {
+            pres_evq[pres_evq_n].slot = pt->slot;
+            pres_evq[pres_evq_n].ts = ts;
+            pres_evq_n++;
+        }
+        return;
+    }
     if (probe->magic == FLIP_MAGIC_SO) {
         struct so_fb *landed = user;
         int out = landed->out;
@@ -641,6 +898,13 @@ static int kms_init(int argc, char **argv) {
                 "session vt first\n");
         goto fail;
     }
+    // universal planes for the primary plane hunt, atomic for the
+    // direct gpu flips. both are optional, the legacy path stays
+    drmSetClientCap(card_fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
+    atomic_ok = drmSetClientCap(card_fd, DRM_CLIENT_CAP_ATOMIC, 1) == 0;
+    if (atomic_ok) {
+        fprintf(stderr, "kms backend: atomic flips armed\n");
+    }
 
     // every connected connector claims a crtc and a chain, the heads
     // tile left to right in scan order
@@ -741,6 +1005,14 @@ static void kms_destroy(void) {
     for (int i = 0; i < X12_OUT_MAX; i++) {
         so_front[i] = 0;
     }
+    for (int i = 0; i < 2; i++) {
+        if (pres_fb[i]) {
+            drmModeRmFB(card_fd, pres_fb[i]);
+            pres_fb[i] = 0;
+            pres_fd[i] = -1;
+        }
+    }
+    pres_front = pres_pending = -1;
     x12_seat_close(seat);
     seat = NULL;
     card_fd = -1;
@@ -1200,6 +1472,7 @@ const struct x12_backend_ops x12_backend_kms = {
     .init = kms_init,
     .get_size = kms_get_size,
     .present = kms_present,
+    .present_gpu = kms_present_gpu,
     .output_count = kms_output_count,
     .output_info = kms_output_info,
     .output_vrr = kms_output_vrr,
@@ -1211,4 +1484,5 @@ const struct x12_backend_ops x12_backend_kms = {
     .host_cursor = 0,
     .scanout = kms_scanout,
     .scanout_poll = kms_scanout_poll,
+    .present_poll = kms_present_poll,
 };

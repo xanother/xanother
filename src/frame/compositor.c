@@ -1,4 +1,5 @@
 // Copyright (c) lezginskiy <xanother-x12@proton.me>
+// Copyright (c) fluent1s (akemi) <m1st1kad3ad1y@gmail.com>
 // SPDX-License-Identifier: MIT
 
 #include "compositor.h"
@@ -30,11 +31,21 @@ static int full_damage;
 // next composite repaints everything to get the mirror honest again
 static int fb_stale;
 
+// the gpu present pair: two scanout bos the folds land in, the backend
+// flips the finished one straight to the screen
+static int pres_fds[2] = { -1, -1 };
+static uint32_t pres_strides[2];
+static int pres_front_idx;
+
 void x12_comp_set_size(uint32_t w, uint32_t h) {
     free(fb);
     fb = calloc((size_t)w * h, sizeof *fb);
     fb_w = w;
     fb_h = h;
+    if (x12_gpu_ready()) {
+        x12_gpu_present_setup(w, h, pres_fds, pres_strides);
+        pres_front_idx = 0;
+    }
     x12_comp_full_damage();
 }
 
@@ -435,25 +446,49 @@ int x12_comp_pass(struct x12_conn *conns, size_t n) {
             }
         }
     }
-    if (gpu) {
-        // one band per damage rect, full width rows; outside the bands
-        // the framebuffer already mirrors the canvas from earlier passes
-        for (int k = 0; k < n_rects; k++) {
-            uint32_t y0 = rects[k].y < 0 ? 0 : (uint32_t)rects[k].y;
-            uint32_t y1 = (uint32_t)(rects[k].y + (int32_t)rects[k].h);
-            if (y1 > fb_h) {
-                y1 = fb_h;
-            }
-            x12_gpu_readback_band((uint8_t *)fb, fb_w * 4, y0, y1);
-        }
-    }
     full_damage = 0;
     fb_stale = 0;
     sprite_last = sview;
     sprite_last_sid = ssid;
     sprite_drawn = have_sprite;
 
-    x12_backend->present(fb, rects, n_rects);
+    // the direct path first: flip the gpu folded frame to the screen
+    // when the backend takes it, the cpu mirror and the cpu present are
+    // skipped entirely and only the fallback pays for the round trip
+    int atomic_armed = 0;
+    if (gpu && pres_fds[0] >= 0 && x12_backend->present_gpu) {
+        int back = 1 - pres_front_idx;
+        if (x12_gpu_present_copy(back)) {
+            struct x12_gpu_frame frame = {
+                .dmabuf_fd = pres_fds[back],
+                .width = fb_w,
+                .height = fb_h,
+                .format = 0x52474241u,  // matches the scanout import path
+                .stride = pres_strides[back],
+                .modifier = 0,
+                .slot = back,
+            };
+            if (x12_backend->present_gpu(&frame, rects, n_rects)) {
+                atomic_armed = 1;
+                pres_front_idx = back;
+            }
+        }
+    }
+    if (!atomic_armed) {
+        if (gpu) {
+            // one band per damage rect, full width rows; outside the bands
+            // the framebuffer already mirrors the canvas from earlier passes
+            for (int k = 0; k < n_rects; k++) {
+                uint32_t y0 = rects[k].y < 0 ? 0 : (uint32_t)rects[k].y;
+                uint32_t y1 = (uint32_t)(rects[k].y + (int32_t)rects[k].h);
+                if (y1 > fb_h) {
+                    y1 = fb_h;
+                }
+                x12_gpu_readback_band((uint8_t *)fb, fb_w * 4, y0, y1);
+            }
+        }
+        x12_backend->present(fb, rects, n_rects);
+    }
     // every surface the pass showed takes the moment the display picks
     // the frame up, one bit per output whose screen carried its pixels.
     // a surface the paint never touched stays silent, no present lies

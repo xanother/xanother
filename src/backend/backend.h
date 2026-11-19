@@ -1,4 +1,5 @@
 // Copyright (c) lezginskiy <xanother-x12@proton.me>
+// Copyright (c) fluent1s (akemi) <m1st1kad3ad1y@gmail.com>
 // SPDX-License-Identifier: MIT
 
 #ifndef X12_BACKEND_H
@@ -34,6 +35,19 @@ struct x12_output_event {
     int out;
 };
 
+// one folded canvas frame handed over as a dma buffer: the gpu pair the
+// compositor folds into owns the buffer, the backend flips it straight
+// to the screen and the cpu pixels stay untouched
+struct x12_gpu_frame {
+    int dmabuf_fd;
+    uint32_t width;
+    uint32_t height;
+    uint32_t format;
+    uint32_t stride;
+    uint64_t modifier;
+    int slot;  // the pair index the compositor folded the frame into
+};
+
 // direct scanout of a client dma buffer: the backend flips the buffer
 // straight to the screen when the hardware takes it, the composite pass
 // stays the fallback for everything the screen cannot show directly
@@ -58,6 +72,13 @@ struct x12_scanout_event {
     uint64_t ts;
 };
 
+// composite presentation progress: the commit that carried the frame
+// reached the screen at ts, the pair slot is free for the next fold
+struct x12_present_event {
+    int slot;
+    uint64_t ts;
+};
+
 struct x12_backend_ops {
     // reads its own flags from argv, returns 0 on success
     int (*init)(int argc, char **argv);
@@ -68,6 +89,11 @@ struct x12_backend_ops {
     // outputs flip and which keep showing what they already have
     void (*present)(const uint32_t *fb, const struct x12_rect *rects,
                     int n_rects);
+    // presents a gpu folded frame straight to the screen without a cpu
+    // round trip, 1 when the frame went out and the cpu mirror can be
+    // skipped, 0 when the caller must composite. may be NULL
+    int (*present_gpu)(const struct x12_gpu_frame *frame,
+                       const struct x12_rect *rects, int n_rects);
     // output slots and their geometry, out of range returns 0
     int (*output_count)(void);
     int (*output_info)(int out, struct x12_out_info *info);
@@ -83,6 +109,8 @@ struct x12_backend_ops {
     int (*scanout)(const struct x12_scanout_req *req);
     // pops one scanout progress event, 1 = filled, 0 = nothing new
     int (*scanout_poll)(struct x12_scanout_event *ev);
+    // pops one composite presentation event, 1 = filled, 0 = nothing
+    int (*present_poll)(struct x12_present_event *ev);
     // pumps host events, may present again on expose
     void (*pump)(void);
     // test bench hook: a host event line the input stand could not
