@@ -1,4 +1,5 @@
 // Copyright (c) lezginskiy <xanother-x12@proton.me>
+// Copyright (c) fluent1s (akemi) <m1st1kad3ad1y@gmail.com>
 // SPDX-License-Identifier: MIT
 
 // seat plumbing: logind takes the device under our session and pokes
@@ -32,6 +33,7 @@ struct x12_seat {
     const char *node;
     int fd;
     int own_fd;
+    int got_master;  // drmSetMaster landed, the drops stay gated on it
     int paused;
     int controlled;
     int tty_fd;
@@ -62,10 +64,13 @@ static void seat_do_pause(struct x12_seat *s) {
         return;
     }
     s->paused = 1;
-    if (s->fd >= 0) {
+    if (s->fd >= 0 && s->got_master) {
         drmDropMaster(s->fd);
+        s->got_master = 0;
+        fprintf(stderr, "seat: device paused, master dropped\n");
+    } else {
+        fprintf(stderr, "seat: device paused\n");
     }
-    fprintf(stderr, "seat: device paused, master dropped\n");
     if (s->ops->on_pause) {
         s->ops->on_pause(s->ud);
     }
@@ -76,10 +81,11 @@ static void seat_do_resume(struct x12_seat *s) {
         return;
     }
     if (s->fd >= 0) {
-        drmSetMaster(s->fd);
+        s->got_master = drmSetMaster(s->fd) == 0;
     }
     s->paused = 0;
-    fprintf(stderr, "seat: device resumed, master set\n");
+    fprintf(stderr, "seat: device resumed, master %s\n",
+            s->got_master ? "set" : "still busy");
     if (s->ops->on_resume) {
         s->ops->on_resume(s->ud, s->fd);
     }
@@ -201,15 +207,23 @@ static int own_fd_open(struct x12_seat *s) {
                 strerror(errno));
         return -1;
     }
-    if (drmSetMaster(s->fd) != 0) {
+    s->got_master = drmSetMaster(s->fd) == 0;
+    if (!s->got_master) {
         fprintf(stderr,
-                "seat: no drm master on %s, a session still owns it: %s\n",
+                "seat: drm master busy on %s, working without it: %s\n",
                 s->node, strerror(errno));
-        close(s->fd);
-        s->fd = -1;
-        return -1;
+        // a stale master entry of a dead run drops away and the retry
+        // picks the device up right after
+        if (drmDropMaster(s->fd) == 0) {
+            s->got_master = drmSetMaster(s->fd) == 0;
+            if (s->got_master) {
+                fprintf(stderr, "seat: master acquired after drop\n");
+            }
+        }
     }
-    fprintf(stderr, "seat: raw open on %s, master set\n", s->node);
+    if (s->got_master) {
+        fprintf(stderr, "seat: raw open on %s, master set\n", s->node);
+    }
     return 0;
 }
 
@@ -418,7 +432,9 @@ void x12_seat_close(struct x12_seat *s) {
         close(s->tty_fd);
     }
     if (s->fd >= 0) {
-        drmDropMaster(s->fd);
+        if (s->got_master) {
+            drmDropMaster(s->fd);
+        }
         close(s->fd);
     }
     sd_bus_slot_unref(s->pause_slot);
