@@ -1,13 +1,24 @@
 // Copyright (c) lezginskiy <xanother-x12@proton.me>
+// Copyright (c) fluent1s (akemi) <m1st1kad3ad1y@gmail.com>
 // SPDX-License-Identifier: MIT
 
 #include "cpu.h"
 
 void x12_cpu_fill(uint32_t *fb, uint32_t fb_w, uint32_t fb_h,
                   const struct x12_rect *r, uint32_t color) {
-    for (uint32_t y = (uint32_t)r->y; y < (uint32_t)r->y + r->h && y < fb_h; y++) {
-        for (uint32_t x = (uint32_t)r->x; x < (uint32_t)r->x + r->w && x < fb_w; x++) {
-            fb[(size_t)y * fb_w + x] = color;
+    // clip to the framebuffer, a negative origin must not wrap around
+    // into a huge unsigned index and land outside the buffer
+    int32_t x0 = r->x < 0 ? 0 : r->x;
+    int32_t y0 = r->y < 0 ? 0 : r->y;
+    int32_t x1 = r->x + (int32_t)r->w < (int32_t)fb_w
+                     ? r->x + (int32_t)r->w
+                     : (int32_t)fb_w;
+    int32_t y1 = r->y + (int32_t)r->h < (int32_t)fb_h
+                     ? r->y + (int32_t)r->h
+                     : (int32_t)fb_h;
+    for (int32_t y = y0; y < y1; y++) {
+        for (int32_t x = x0; x < x1; x++) {
+            fb[(size_t)y * fb_w + (size_t)x] = color;
         }
     }
 }
