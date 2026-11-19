@@ -741,13 +741,12 @@ x12_swapchain_rebuild(ScreenPtr pScreen, uint32_t w, uint32_t h)
     int s1 = s0 >= 0 ? x12_bridge_dmabuf_attach(fds[1], strides[1], 0, w, h)
                      : -1;
     if (s0 < 0 || s1 < 0 || !x12_bridge_dmabuf_show(0)) {
-        // a half built chain walks back to the pool pump, the wire
-        // import closed the shown fd and the other one dies here
-        for (int i = 0; i < 2; i++) {
-            if (s1 >= 0 && i == 0) {
-                continue;
-            }
-            close(fds[i]);
+        // the attach owns the fd on every path and closed it already,
+        // the only descriptor still ours is the second target when the
+        // first attach refused to take it. a second close here would
+        // race the number against the next open
+        if (s0 < 0) {
+            close(fds[1]);
         }
         return FALSE;
     }
