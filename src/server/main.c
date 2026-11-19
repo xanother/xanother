@@ -189,6 +189,11 @@ int main(int argc, char **argv) {
             if (x12_input_file_open(argv[i]) != 0) {
                 fprintf(stderr, "x12-server: cannot open input %s\n", argv[i]);
                 close(srv);
+                // same reason as the backend path: a stale socket file
+                // would swallow the next spawn
+                if (addr.kind == X12_NET_UNIX) {
+                    unlink(addr.path);
+                }
                 return 1;
             }
         } else if (strcmp(argv[i], "--evdev") == 0 && i + 1 < argc) {
@@ -196,6 +201,9 @@ int main(int argc, char **argv) {
             if (x12_evdev_add(argv[i]) != 0) {
                 fprintf(stderr, "x12-server: cannot open evdev %s\n", argv[i]);
                 close(srv);
+                if (addr.kind == X12_NET_UNIX) {
+                    unlink(addr.path);
+                }
                 return 1;
             }
         }
