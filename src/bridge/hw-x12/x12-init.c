@@ -293,7 +293,8 @@ x12PresentGetUstMsc(RRCrtcPtr crtc, uint64_t *ust, uint64_t *msc)
     return Success;
 }
 
-static void x12_present_complete_all(uint64_t ust, uint64_t msc);
+static void x12_present_complete_all(uint64_t ust, uint64_t msc,
+                                     OsTimerPtr firing);
 
 // a refresh period passed without a session flip: the display kept
 // scanning out the last frame, msc follows the refresh count and the
@@ -303,17 +304,29 @@ x12PresentTimer(OsTimerPtr timer, CARD32 now, void *arg)
 {
     (void)now;
     (void)arg;
-    // returning zero frees the one shot timer, an explicit TimerFree
-    // here would double free it
-    x12_present_complete_all(GetTimeInMicros(), x12_present_msc + 1);
+    // returning zero only unlinks the timer, it stays allocated; the
+    // completion below frees it along with its pending entry
+    x12_present_complete_all(GetTimeInMicros(), x12_present_msc + 1,
+                             timer);
     return 0;
 }
 
 static void
-x12_present_complete_all(uint64_t ust, uint64_t msc)
+x12_present_complete_all(uint64_t ust, uint64_t msc, OsTimerPtr firing)
 {
     x12_present_msc = msc;
     x12_present_ust = ust;
+    // the firing timer is unlinked already but its list links still
+    // point at live neighbours: it dies first and that del is an exact
+    // no-op. freeing a neighbour first would leave its stale links
+    // walking into freed nodes
+    for (int i = 0; i < x12_present_np; i++) {
+        if (firing && x12_present_pending[i].timer == firing) {
+            TimerFree(firing);
+            firing = NULL;
+            x12_present_pending[i].timer = NULL;
+        }
+    }
     for (int i = 0; i < x12_present_np; i++) {
         if (x12_present_pending[i].timer) {
             TimerCancel(x12_present_pending[i].timer);
@@ -393,7 +406,8 @@ void
 x12_present_flip_seen(uint64_t ts_ns, int is_flip)
 {
     if (is_flip && x12_present_np > 0) {
-        x12_present_complete_all(ts_ns / 1000, x12_present_msc + 1);
+        x12_present_complete_all(ts_ns / 1000, x12_present_msc + 1,
+                                 NULL);
         return;
     }
     if (is_flip) {
