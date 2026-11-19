@@ -1,4 +1,5 @@
 // Copyright (c) lezginskiy <xanother-x12@proton.me>
+// Copyright (c) fluent1s (akemi) <m1st1kad3ad1y@gmail.com>
 // SPDX-License-Identifier: MIT
 
 #include "gpu.h"
@@ -876,7 +877,7 @@ int x12_gpu_present_copy(int idx) {
     p_glBindFramebuffer(GL_FRAMEBUFFER, copy_fbo);
     p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                              GL_TEXTURE_2D, pres[idx].tex, 0);
-    unorm_draw(0);
+    unorm_draw(pres[idx].swap);
     // the page flip the backend arms reads the bo straight away, the
     // pass must be on the hardware before the ioctl
     p_glFinish();
