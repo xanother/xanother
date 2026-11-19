@@ -515,9 +515,13 @@ x12_glamor_target_create(ScreenPtr pScreen, uint32_t w, uint32_t h,
     // denies every mode ioctl; the dmabuf keeps the memory alive after
     // the primary fd closes
     const char *card = drmGetPrimaryDeviceNameFromFd(node);
+    if (!card) {
+        return 0;
+    }
     int cfd = open(card, O_RDWR | O_CLOEXEC);
+    free((void *)card);
     if (cfd < 0) {
-        ErrorF("Xx12: dmabuf target, primary node %s refused\n", card);
+        ErrorF("Xx12: dmabuf target, primary node refused\n");
         return 0;
     }
     struct drm_mode_create_dumb cd = { .width = w, .height = h, .bpp = 32 };
