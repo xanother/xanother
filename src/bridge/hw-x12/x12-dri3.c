@@ -156,13 +156,22 @@ x12Dri3PixmapFromFds(ScreenPtr screen, CARD8 num_fds, const int *fds,
         return NULL;
     }
     glamor_set_pixmap_type(pixmap, GLAMOR_TEXTURE_DRM);
+    int slot = -1;
     for (int i = 0; i < X12_DRI3_IMAGES; i++) {
         if (!images[i].pixmap) {
-            images[i].pixmap = pixmap;
-            images[i].image = image;
+            slot = i;
             break;
         }
     }
+    if (slot < 0) {
+        // an untracked image never dies with its pixmap, refuse the
+        // import instead of leaking it past the table
+        eglDestroyImageKHR(x12_glamor_display(), image);
+        screen->DestroyPixmap(pixmap);
+        return NULL;
+    }
+    images[slot].pixmap = pixmap;
+    images[slot].image = image;
     (void) glamor_priv;
     return pixmap;
 }
