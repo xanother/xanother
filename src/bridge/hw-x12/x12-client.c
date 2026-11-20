@@ -388,6 +388,11 @@ static int do_resize(uint32_t w, uint32_t h)
     if (buf_id && buf_retired_n <
         (int)(sizeof buf_retired / sizeof *buf_retired)) {
         buf_retired[buf_retired_n++] = buf_id;
+    } else if (buf_id) {
+        // a full ring under a release stall drops the retirement and
+        // the buffer outlives the session: say so instead of leaking
+        // it silently
+        fprintf(stderr, "Xx12: retire ring full, buffer %u leaks\n", buf_id);
     }
     buf_id = nb;
     // the fresh carve starts black: the old content belongs to the old
@@ -626,6 +631,8 @@ x12_bridge_dmabuf_attach(int fd, uint32_t stride, uint64_t modifier,
         if (buf_retired_n <
             (int)(sizeof buf_retired / sizeof *buf_retired)) {
             buf_retired[buf_retired_n++] = buf_id;
+        } else {
+            fprintf(stderr, "Xx12: retire ring full, buffer %u leaks\n", buf_id);
         }
         buf_id = 0;
     }
@@ -673,8 +680,14 @@ void
 x12_bridge_dmabuf_reset(void)
 {
     for (int i = 0; i < dmabuf_slots; i++) {
-        if (dmabuf_ids[i] && buf_retired_n < 8) {
+        if (!dmabuf_ids[i]) {
+            continue;
+        }
+        if (buf_retired_n < 8) {
             buf_retired[buf_retired_n++] = dmabuf_ids[i];
+        } else {
+            fprintf(stderr, "Xx12: retire ring full, buffer %u leaks\n",
+                    dmabuf_ids[i]);
         }
     }
     dmabuf_slots = 0;
