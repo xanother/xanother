@@ -203,6 +203,10 @@ x12_make_display(EGLint *major, EGLint *minor)
             if (dpy != EGL_NO_DISPLAY) {
                 eglTerminate(dpy);
             }
+            // the surfaceless fallback below rides no gbm device, the
+            // orphan dies here instead of outliving the init
+            gbm_device_destroy(gbm_dev);
+            gbm_dev = NULL;
         }
     }
     EGLDisplay dpy = eglGetPlatformDisplayEXT(EGL_PLATFORM_SURFACELESS_MESA,
