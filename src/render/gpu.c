@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 
 #include <EGL/egl.h>
@@ -17,6 +18,27 @@
 #include <GLES3/gl3ext.h>
 
 #include <gbm.h>
+
+// platform and device enums the build headers may predate, the values
+// are fixed by the extensions and never change
+#ifndef EGL_PLATFORM_GBM_KHR
+#define EGL_PLATFORM_GBM_KHR 0x31D4
+#endif
+#ifndef EGL_PLATFORM_DEVICE_EXT
+#define EGL_PLATFORM_DEVICE_EXT 0x313F
+#endif
+#ifndef EGL_DRM_DEVICE_FILE_EXT
+#define EGL_DRM_DEVICE_FILE_EXT 0x3233
+#endif
+#ifndef EGL_EXT_device_enumeration
+#define EGL_EXT_device_enumeration 1
+typedef void *EGLDeviceINTC;
+typedef EGLBoolean (*PFNEGLQUERYDEVICESEXTPROC)(EGLint max_devices,
+                                                EGLDeviceINTC *devices,
+                                                EGLint *num_devices);
+typedef const char *(*PFNEGLQUERYDEVICESTRINGEXTPROC)(EGLDeviceINTC device,
+                                                      EGLint name);
+#endif
 
 // 'ABGR', 'ARGB' and 'XRGB', the fourcc tags the bo and its gl import
 // share; raw values keep the build free of libdrm include paths
@@ -159,6 +181,10 @@ static EGLDisplay dpy;
 static EGLContext ctx;
 static EGLSurface surf;
 static int ready;
+// a context without a canvas sized to the screen paints nothing: the
+// compositor reads ready and falls back to the cpu blend unless both
+// came up
+static int canvas_ok;
 
 static uint32_t canvas_w, canvas_h;
 static GLuint prog, fill_prog, copy_prog, vao;
@@ -454,6 +480,95 @@ fail:
     return 0;
 }
 
+// raw drm version probe, this file stays free of libdrm include
+// paths the same way the fourcc tags do
+struct x12_drm_version {
+    int version_major;
+    int version_minor;
+    int version_patchlevel;
+    size_t name_len;
+    char *name;
+    size_t date_len;
+    char *date;
+    size_t desc_len;
+    char *desc;
+};
+#define X12_DRM_IOCTL_VERSION _IOWR('d', 0, struct x12_drm_version)
+
+// the driver name behind a drm fd, empty when the ioctl does not come
+// through. a nvidia card runs the whole pipeline only with nvidia-drm
+// modeset=1 and its gbm backend in place, the log says so out loud
+// instead of a mystery fallback to the cpu path
+static void log_drm_driver(int fd, const char *node) {
+    char name[64] = {0};
+    char scratch[256] = {0};
+    struct x12_drm_version v;
+    memset(&v, 0, sizeof v);
+    v.name = name;
+    v.name_len = sizeof name - 1;
+    v.date = scratch;
+    v.date_len = 127;
+    v.desc = scratch + 128;
+    v.desc_len = 127;
+    if (ioctl(fd, X12_DRM_IOCTL_VERSION, &v) != 0) {
+        return;
+    }
+    fprintf(stderr, "gpu engine: drm driver %s on %s\n", name,
+            node ? node : "default");
+    if (strstr(name, "nvidia")) {
+        fprintf(stderr,
+                "gpu engine: nvidia needs nvidia-drm modeset=1 for scanout "
+                "and the nvidia gbm backend for the present pair\n");
+    }
+}
+
+// the egl device enumeration is the path for drivers whose render
+// node does not do gbm, the nvidia stack is the common case. the
+// display comes off EGL_PLATFORM_DEVICE_EXT, the present bos still
+// need a gbm device and the scanout pair falls back to the cpu path
+// without one
+static int try_device_display(const char *node,
+                              PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform) {
+    PFNEGLQUERYDEVICESEXTPROC query_devices =
+        (PFNEGLQUERYDEVICESEXTPROC) p_eglGetProcAddress("eglQueryDevicesEXT");
+    PFNEGLQUERYDEVICESTRINGEXTPROC query_string =
+        (PFNEGLQUERYDEVICESTRINGEXTPROC) p_eglGetProcAddress(
+            "eglQueryDeviceStringEXT");
+    if (!query_devices || !query_string || !get_platform) {
+        return 0;
+    }
+    EGLDeviceEXT devices[8];
+    EGLint n = 0;
+    if (!query_devices(8, devices, &n) || n <= 0) {
+        return 0;
+    }
+    // the node names the device when given, otherwise the first one
+    // with a drm device file wins
+    EGLDeviceEXT picked = NULL;
+    char picked_file[64] = {0};
+    for (EGLint i = 0; i < n && !picked; i++) {
+        const char *file = query_string(devices[i], EGL_DRM_DEVICE_FILE_EXT);
+        if (!file || !*file) {
+            continue;
+        }
+        if (node && strcmp(file, node) != 0) {
+            continue;
+        }
+        picked = devices[i];
+        snprintf(picked_file, sizeof picked_file, "%s", file);
+    }
+    if (!picked) {
+        return 0;
+    }
+    dpy = get_platform(EGL_PLATFORM_DEVICE_EXT, picked, NULL);
+    if (dpy == EGL_NO_DISPLAY || !build_context(dpy)) {
+        dpy = EGL_NO_DISPLAY;
+        return 0;
+    }
+    fprintf(stderr, "gpu engine: context on egl device %s\n", picked_file);
+    return 1;
+}
+
 int x12_gpu_init(const char *node) {
     if (!resolve_syms()) {
         fprintf(stderr, "gpu engine: no usable gl stack, cpu blend path\n");
@@ -469,10 +584,17 @@ int x12_gpu_init(const char *node) {
     if (node && resolve_gbm()) {
         gbm_fd = open(node, O_RDWR | O_CLOEXEC);
         if (gbm_fd >= 0) {
+            log_drm_driver(gbm_fd, node);
             gbm_dev = p_gbm_create_device(gbm_fd);
         }
         if (gbm_dev && get_platform) {
+            // nvidia ships a gbm backend behind the khr enum, mesa
+            // answers the mesa one: both are tried before the display
+            // gives up on the node
             dpy = get_platform(EGL_PLATFORM_GBM_MESA, gbm_dev, NULL);
+            if (dpy == EGL_NO_DISPLAY) {
+                dpy = get_platform(EGL_PLATFORM_GBM_KHR, gbm_dev, NULL);
+            }
             if (dpy != EGL_NO_DISPLAY && build_context(dpy)) {
                 fprintf(stderr, "gpu engine: context on %s\n", node);
                 return 1;
@@ -487,6 +609,12 @@ int x12_gpu_init(const char *node) {
             close(gbm_fd);
             gbm_fd = -1;
         }
+    }
+    // the device enumeration sits between the node and the
+    // surfaceless fallback: a driver without a usable gbm still gets
+    // its real gpu for the canvas instead of dropping to llvmpipe
+    if (try_device_display(node, get_platform)) {
+        return 1;
     }
     if (get_platform) {
         dpy = get_platform(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY,
@@ -535,18 +663,22 @@ void x12_gpu_shutdown(void) {
     canvas_w = canvas_h = 0;
     fbo = 0;
     ready = 0;
+    canvas_ok = 0;
 }
 
 int x12_gpu_ready(void) {
-    return ready;
+    return ready && canvas_ok;
 }
 
 int x12_gpu_canvas(uint32_t w, uint32_t h) {
     if (!ready || !w || !h || w > 8192 || h > 8192) {
+        canvas_ok = 0;
         return 0;
     }
     if (canvas_w == w && canvas_h == h) {
-        return 1;
+        // a repeat at the live size reports the truth of the canvas,
+        // not a success the last attempt may never have earned
+        return canvas_ok;
     }
     canvas_w = w;
     canvas_h = h;
@@ -570,6 +702,7 @@ int x12_gpu_canvas(uint32_t w, uint32_t h) {
     p_glBindTexture(GL_TEXTURE_2D, src_tex);
     p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    canvas_ok = 1;
     return 1;
 }
 

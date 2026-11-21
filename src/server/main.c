@@ -254,8 +254,15 @@ int main(int argc, char **argv) {
     }
     if (want_gpu) {
         if (x12_gpu_init(gpu_node)) {
-            x12_gpu_canvas(canvas_w, canvas_h);
-            fprintf(stderr, "x12-server: gpu canvas active\n");
+            // a gl stack that comes up but cannot take the canvas size
+            // must not print a success it cannot back up: the cpu path
+            // still owns the screen then
+            if (x12_gpu_canvas(canvas_w, canvas_h)) {
+                fprintf(stderr, "x12-server: gpu canvas active\n");
+            } else {
+                fprintf(stderr,
+                        "x12-server: gpu canvas unavailable, cpu path\n");
+            }
         } else {
             fprintf(stderr, "x12-server: gpu engine unavailable, cpu path\n");
         }
