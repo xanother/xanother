@@ -26,8 +26,11 @@ usage: x12start [options] [command ...]
   -ppm PATH     write the frame to a ppm after every draw
   -kms          output to the real drm screen (card from X12_KMS_NODE
                 or the first under /dev/dri)
-  -gpu          blend on the gl canvas
+  -gpu          force the gl canvas (it turns on by itself when a
+                render node exists)
+  -no-gpu       hold the gl canvas off, the cpu path owns the screen
   -grants LIST  comm names the isolation lets see the window tree
+                (desktop shells come granted by default)
   -h            this help
 
 with no command the session comes from ~/.x12initrc, falling back to
@@ -53,7 +56,16 @@ sock=/tmp/x12-$(id -u).sock
 ppm=
 kms=no
 gpu=no
-grants=${X12_BRIDGE_GRANTS:-xwininfo,xdotool,xrandr}
+grants=${X12_BRIDGE_GRANTS:-}
+if [ -z "$grants" ]; then
+    # the desktop shell is part of the manager trust domain: panels,
+    # desktops and settings daemons read the ewmh properties off the
+    # root window, without the grant they starve and fall over
+    grants=xwininfo,xdotool,xrandr
+    grants=$grants,xfce4-session,xfce4-panel,xfdesktop,xfsettingsd
+    grants=$grants,wrapper-1.0,wrapper-2.0
+    grants=$grants,plasmashell,gnome-shell,mate-panel,lxqt-panel
+fi
 
 while [ $# -gt 0 ]; do
     case $1 in
@@ -64,6 +76,7 @@ while [ $# -gt 0 ]; do
     -grants) [ $# -ge 2 ] || usage 1; grants=$grants,$2; shift 2;;
     -kms)    kms=yes; shift;;
     -gpu)    gpu=yes; shift;;
+    -no-gpu) gpu=skip; shift;;
     -h)      usage 0;;
     --)      shift; break;;
     -*)      echo "x12start: unknown option $1" >&2; usage 1;;
@@ -105,6 +118,7 @@ exec xterm
 # exec fvwm3
 # exec i3
 # exec dbus-run-session -- sh -c 'kwin_x11 & plasmashell & wait'
+# exec dbus-run-session -- sh -c 'export XDG_MENU_PREFIX=xfce-; exec xfce4-session'
 EOF
     echo "x12start: wrote ~/.x12initrc, edit it to pick your window manager"
 fi
@@ -131,6 +145,16 @@ kms_node=${X12_KMS_NODE:-}
 if [ -z "$kms_node" ]; then
     for n in /dev/dri/card*; do
         [ -e "$n" ] && { kms_node=$n; break; }
+    done
+fi
+
+# zero-copy by default: whenever a render node is around the gl canvas
+# comes up and the dmabuf exports ride straight into scanout. a gl
+# stack that fails walks back to the cpu path on its own, so turning
+# this on ahead of the facts costs nothing but one log line
+if [ "$gpu" = no ]; then
+    for n in /dev/dri/renderD*; do
+        [ -e "$n" ] && { gpu=yes; break; }
     done
 fi
 
