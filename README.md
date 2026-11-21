@@ -28,7 +28,11 @@ libssl-dev zlib1g-dev
 meson ninja-build
 libpixman-1-dev x11proto-dev libxkbfile-dev libxfont-dev libxcvt-dev
 libepoxy-dev libglvnd-dev mesa-common-dev libgl1-mesa-dev libxshmfence-dev
+libinput-dev
 ```
+
+`libinput-dev` is optional: a build without it compiles the seat input
+to a stub and `--evdev` stays the input path.
 
 Build:
 
@@ -58,7 +62,9 @@ sh tools/x12start -kms fvwm3          # output to real drm
 sh tools/x12start -ppm frame.ppm      # keep the frame on disk
 ```
 
-Options: `-d` display for the bridge, `-s` canvas size, `-sock` listen address, `-ppm`, `-kms`, `-gpu`, `-grants` (comma-separated process names the isolation lets see the window tree). with neither `-ppm` nor `-kms` the picture goes to the real drm screen when there is one and falls back to a ppm file when there is not - the path is printed at startup. the drm screen needs a free card, so stop the login manager and run from a tty, exactly like startx. the x keyboard compiler (`x11-xkb-utils` on deb, `xorg-xkbcomp` on arch) is needed to build the keymap.
+Options: `-d` display for the bridge, `-s` canvas size, `-sock` listen address, `-ppm`, `-kms`, `-gpu` / `-no-gpu`, `-grants` (comma-separated process names the isolation lets see the window tree). with neither `-ppm` nor `-kms` the picture goes to the real drm screen when there is one and falls back to a ppm file when there is not - the path is printed at startup. the drm screen needs a free card, so stop the login manager and run from a tty, exactly like startx. the x keyboard compiler (`x11-xkb-utils` on deb, `xorg-xkbcomp` on arch) is needed to build the keymap.
+
+zero-copy is the default, not a switch: `x12start` blends on the gl canvas whenever a render node exists, the dmabuf exports go straight into scanout, and a gl stack that does not come up walks back to the cpu path on its own (`-no-gpu` holds it off). desktop shells (xfce, kde, gnome, mate, lxqt panels and daemons) come granted by default - they read the ewmh properties off the root window and starve without them; a full desktop session starts like `sh tools/x12start -kms dbus-run-session -- xfce4-session`.
 
 The long form, piece by piece - server first. The first argument is the address, in three forms:
 
@@ -70,9 +76,11 @@ The long form, piece by piece - server first. The first argument is the address,
 ./build/x12-server /tmp/x12.sock --width 1280 --height 720 --ppm frame.ppm
 ```
 
-Flags: `--ppm PATH` (headless mode, the server writes the frame after every draw), `--width` / `--height`, `--heads N` (multiple heads), `--gpu` and `--gpu-node /dev/dri/renderD128` (GL canvas), `--kms` (output to real DRM), `--input FIFO` (input as lines: `motion X Y`, `button N press|release`, `key K press|release`), `--evdev NODE` (multiple allowed).
+Flags: `--ppm PATH` (headless mode, the server writes the frame after every draw), `--width` / `--height`, `--heads N` (multiple heads), `--gpu` and `--gpu-node /dev/dri/renderD128` (GL canvas), `--kms` (output to real DRM), `--kms-node /dev/dri/cardN` (a specific primary node, the escape hatch for multi gpu boxes), `--hdr` (arm static HDR output metadata on every head that exposes the property), `--no-fps-stats` (silence the frame pacing report), `--input FIFO` (input as lines: `motion X Y`, `button N press|release`, `key K press|release`), `--evdev NODE` (multiple allowed), `--libinput` / `--no-libinput` (the udev seat input, on by default on a build that had libinput).
 
 TLS: the server needs `X12_TLS_CERT` and `X12_TLS_KEY`; the client verifies the certificate against `X12_TLS_CA` or turns verification off with `X12_TLS_INSECURE=1`. how long a disconnected session stays alive is `X12_SESSION_TTL_MS` (30 seconds by default).
+
+NVIDIA: the proprietary driver needs `nvidia-drm modeset=1` (`modprobe nvidia_drm modeset=1`) and its gbm backend (`libnvidia-egl-gbm`) before `--gpu` and `--kms` can put the canvas and the scanout pair on the card. the gpu engine tries the gbm path on the render node first, then the egl device enumeration (`EGL_PLATFORM_DEVICE_EXT`), then the surfaceless fallback - a driver without a working gbm still gets its gpu canvas, only the direct scanout pair walks back to the cpu path. both the gpu engine and the kms backend print the drm driver name at startup and say exactly which switch is missing, so a silent fallback is distinguishable from the real thing.
 
 The bridge connects to the server as an ordinary client:
 
@@ -81,7 +89,7 @@ X12_BRIDGE_SOCKET=/tmp/x12.sock build/vendor/xserver/build/hw/x12/Xx12 :90 -ac -
 DISPLAY=:90 fvwm
 ```
 
-Bridge environment: `X12_BRIDGE_WIDTH` / `X12_BRIDGE_HEIGHT` (canvas size), `X12_BRIDGE_FULLSCREEN`, `X12_BRIDGE_GLAMOR` (GL acceleration), `X12_BRIDGE_GRANTS` (comma-separated process names the isolation lets see the window tree - `xwininfo`, `xrandr` and so on).
+Bridge environment: `X12_BRIDGE_WIDTH` / `X12_BRIDGE_HEIGHT` (canvas size), `X12_BRIDGE_FULLSCREEN`, `X12_BRIDGE_GLAMOR` (GL acceleration), `X12_BRIDGE_GRANTS` (comma-separated process names the isolation lets see the window tree - `xwininfo`, `xrandr`, the desktop shell processes and so on; the window manager itself is found on its own through SubstructureRedirect and never needs a grant).
 
 ## License
 
