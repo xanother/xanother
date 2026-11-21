@@ -1,5 +1,6 @@
 // Copyright (c) lezginskiy <xanother-x12@proton.me>
 // SPDX-License-Identifier: MIT
+// Copyright (c) fluent1s (akemi) <m1st1kad3ad1y@gmail.com>
 
 #ifndef X12_STATE_H
 #define X12_STATE_H
@@ -59,7 +60,6 @@ struct x12_pool_state {
     size_t size;
     // 1 = server side pixels fed by pool writes, freed with free()
     int net;
-    uint32_t owner;  // unused today, kept next to the mapping it describes
 };
 
 struct x12_buffer_state {

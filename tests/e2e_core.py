@@ -105,7 +105,7 @@ def main():
             s.register("x12_callback", oid)
             done = s.wait_for("done")
             assert done["object"] == oid, done
-        s.request("x12_connection", "sync", 1, callback=32)
+        s.request("x12_connection", "sync", 1, callback=64)
         err = s.wait_for("error")
         assert err["args"]["code"] == "invalid-id", err
         s.close()

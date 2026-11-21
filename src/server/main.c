@@ -276,7 +276,9 @@ int main(int argc, char **argv) {
             session_ttl_ns = (uint64_t)atoi(ttl) * 1000000ull;
         }
     }
-    struct x12_conn conns[X12_MAX_CLIENTS];
+    // static, not stack: the connection array carries a full object
+    // table per client, a few hundred kilobytes belong in bss
+    static struct x12_conn conns[X12_MAX_CLIENTS];
     for (size_t i = 0; i < X12_MAX_CLIENTS; i++) {
         conns[i].fd = -1;
     }
@@ -371,6 +373,9 @@ int main(int argc, char **argv) {
                 // scene presence wait behind the resume token
                 if (!x12_conn_park(c, session_ttl_ns)) {
                     client_teardown(c);
+                    // fully reaped: the later pass must not run the
+                    // teardown a second time
+                    c->dead = 0;
                 }
                 else {
                     // the transport is gone: a parked client cannot
@@ -399,6 +404,7 @@ int main(int argc, char **argv) {
                 x12_conn_flush(&conns[i]);
                 if (!x12_conn_park(&conns[i], session_ttl_ns)) {
                     client_teardown(&conns[i]);
+                    conns[i].dead = 0;
                 }
                 else {
                     x12_selection_release_owner(&conns[i]);
