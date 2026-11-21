@@ -392,15 +392,18 @@ int x12_decode(const x12_iface_desc *iface, const x12_msg_desc *msg,
                     return X12_ERR_FRAME;
                 }
             }
-            // padding sits right after the payload, checked before consuming
-            for (size_t k = 0; k < pad; k++) {
-                if (off[k] != 0) {
-                    return X12_ERR_FRAME;
-                }
-            }
+            // padding sits right after the payload: the bounds check
+            // happens first, the payload can end the frame and the pad
+            // must never be read past it
             rc = need(&off, &left, pad);
             if (rc != X12_OK) {
                 return rc;
+            }
+            const uint8_t *padbytes = off - pad;
+            for (size_t k = 0; k < pad; k++) {
+                if (padbytes[k] != 0) {
+                    return X12_ERR_FRAME;
+                }
             }
             a->str = s;
             a->str_len = slen;
