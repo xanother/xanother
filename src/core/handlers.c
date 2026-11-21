@@ -132,7 +132,12 @@ static int handle_sync(struct x12_conn *c, uint32_t object, const x12_arg *args)
     }
     // the one shot continuation closes with a fresh serial
     x12_arg d[1] = { { .u64 = x12_conn_next_serial(c) } };
-    return x12_conn_event(c, x12_iface_find("x12_callback"), "done", id, d, 1);
+    int rc = x12_conn_event(c, x12_iface_find("x12_callback"), "done", id, d, 1);
+    // the callback is one shot and its interface takes no requests:
+    // the slot goes back right away, a table of 32 ids would otherwise
+    // fill up with dead continuations and strand the connection
+    x12_objects_free(&c->objects, id);
+    return rc;
 }
 
 int x12_handle_connection(struct x12_conn *c, uint32_t object,
@@ -1226,6 +1231,13 @@ int x12_handle_data_device(struct x12_conn *c, uint32_t object,
     return 0;
 }
 
+// wire strings are not nul terminated: the comparison runs over the
+// declared length, a strcmp would walk past the end of the frame
+static int str_eq(const char *nul_term, const x12_arg *a) {
+    return strlen(nul_term) == a->str_len &&
+           memcmp(nul_term, a->str, a->str_len) == 0;
+}
+
 int x12_handle_data_source(struct x12_conn *c, uint32_t object,
                            const x12_msg_desc *msg, const x12_arg *args) {
     struct x12_object *o = x12_objects_get(&c->objects, object);
@@ -1238,7 +1250,7 @@ int x12_handle_data_source(struct x12_conn *c, uint32_t object,
         }
         int dup = 0;
         for (uint32_t i = 0; i < src->n_mimes; i++) {
-            if (strcmp(src->mimes[i], args[0].str) == 0) {
+            if (str_eq(src->mimes[i], &args[0])) {
                 dup = 1;
                 break;
             }
@@ -1295,7 +1307,7 @@ int x12_handle_data_offer(struct x12_conn *c, uint32_t object,
             owner ? x12_objects_get(&owner->objects, sid) : 0;
         int known = 0;
         for (uint32_t i = 0; src && i < src->as.data_source.n_mimes; i++) {
-            if (strcmp(src->as.data_source.mimes[i], args[0].str) == 0) {
+            if (str_eq(src->as.data_source.mimes[i], &args[0])) {
                 known = 1;
                 break;
             }
