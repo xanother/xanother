@@ -18,6 +18,7 @@
 
 #include <poll.h>
 #include <time.h>
+#include <dirent.h>
 
 #include <libudev.h>
 
@@ -78,11 +79,28 @@ struct output {
 // a flip event for the gpu present pair, the tag names its kind
 #define FLIP_MAGIC_PRES 0x50524553u
 
-#define X12_OUT_MAX 4
+// more heads split the screen into n tiles, the choice stops at eight
+#define X12_OUT_MAX 8
 
 static int card_fd = -1;
 static struct x12_seat *seat;
 static int seat_paused;
+static int max_heads = X12_OUT_MAX;
+static int hdr_wanted;
+// frame pacing counters, the report names the min/avg/max interval and
+// how often a landing ran late against the fastest head's refresh
+static struct {
+    int enabled;
+    uint64_t span_start;
+    uint64_t last_ts;
+    uint64_t min_ns, max_ns, sum_ns;
+    uint64_t target_ns;
+    uint32_t frames, late;
+} fps;
+
+static void fps_flip(uint64_t ts);
+static void fps_report(void);
+static uint64_t now_ns(void);
 // the ppm watch sits next to the real screen when a path was named,
 // the nameless fallback keeps pixels for the test tools
 static char ppm_path[512];
@@ -130,6 +148,186 @@ static void push_out_event(int kind, int out) {
         out_evq[out_evq_n].kind = kind;
         out_evq[out_evq_n].out = out;
         out_evq_n++;
+    }
+}
+
+// one flip landing feeds the pacing counters, the delta between two
+// landings is one frame interval on that head
+static void fps_flip(uint64_t ts) {
+    if (!fps.enabled || !ts || ts == fps.last_ts) {
+        return;
+    }
+    if (fps.last_ts) {
+        uint64_t d = ts - fps.last_ts;
+        if (!fps.min_ns || d < fps.min_ns) {
+            fps.min_ns = d;
+        }
+        if (d > fps.max_ns) {
+            fps.max_ns = d;
+        }
+        fps.sum_ns += d;
+        if (fps.target_ns && d > fps.target_ns + fps.target_ns / 2) {
+            fps.late++;
+        }
+    }
+    fps.last_ts = ts;
+    fps.frames++;
+}
+
+static void fps_report(void) {
+    if (!fps.enabled || !fps.frames || !fps.span_start) {
+        return;
+    }
+    uint64_t now = now_ns();
+    double secs = (double)(now - fps.span_start) / 1e9;
+    if (secs <= 0) {
+        return;
+    }
+    uint32_t deltas = fps.frames > 1 ? fps.frames - 1 : 1;
+    fprintf(stderr,
+            "kms backend: %u frames in %.1fs (%.1f fps), interval min "
+            "%.2fms avg %.2fms max %.2fms, late %u\n",
+            fps.frames, secs, (double)fps.frames / secs, fps.min_ns / 1e6,
+            (fps.sum_ns / deltas) / 1e6, fps.max_ns / 1e6, fps.late);
+    fps.frames = 0;
+    fps.late = 0;
+    fps.min_ns = fps.max_ns = fps.sum_ns = 0;
+    fps.span_start = now;
+}
+
+// static HDR output metadata: the blob arms every head that exposes
+// HDR_OUTPUT_METADATA with the static description of a bt.2020 pq
+// panel. the enums the metadata needs are spelled out locally so the
+// build does not grow a kernel header dependency
+#ifndef HDMI_STATIC_METADATA_TYPE1
+#define HDMI_STATIC_METADATA_TYPE1 1
+#endif
+#ifndef HDMI_EOTF_SMPTE_ST2084
+#define HDMI_EOTF_SMPTE_ST2084 2
+#endif
+
+static uint32_t hdr_blob[X12_OUT_MAX];
+
+static uint32_t conn_prop_id(uint32_t obj, const char *name) {
+    drmModeObjectPropertiesPtr ps =
+        drmModeObjectGetProperties(card_fd, obj, DRM_MODE_OBJECT_CONNECTOR);
+    if (!ps) {
+        return 0;
+    }
+    uint32_t id = 0;
+    for (uint32_t i = 0; i < ps->count_props; i++) {
+        drmModePropertyPtr pr = drmModeGetProperty(card_fd, ps->props[i]);
+        if (!pr) {
+            continue;
+        }
+        if (strcmp(pr->name, name) == 0) {
+            id = pr->prop_id;
+        }
+        drmModeFreeProperty(pr);
+        if (id) {
+            break;
+        }
+    }
+    drmModeFreeObjectProperties(ps);
+    return id;
+}
+
+static uint64_t conn_prop_enum(uint32_t obj, const char *prop,
+                               const char *value) {
+    uint32_t id = conn_prop_id(obj, prop);
+    if (!id) {
+        return 0;
+    }
+    uint64_t ret = 0;
+    drmModePropertyPtr pr = drmModeGetProperty(card_fd, id);
+    if (!pr) {
+        return 0;
+    }
+    for (int i = 0; i < pr->count_enums; i++) {
+        if (strcmp(pr->enums[i].name, value) == 0) {
+            ret = (uint64_t)pr->enums[i].value;
+            break;
+        }
+    }
+    drmModeFreeProperty(pr);
+    return ret;
+}
+
+static void hdr_arm(void) {
+    for (int i = 0; i < n_out_slots; i++) {
+        struct output *o = &outs[i];
+        if (!o->live || !o->conn_id || hdr_blob[i]) {
+            continue;
+        }
+        uint32_t prop = conn_prop_id(o->conn_id, "HDR_OUTPUT_METADATA");
+        if (!prop) {
+            fprintf(stderr, "kms backend: head %s has no HDR_OUTPUT_METADATA\n",
+                    o->name);
+            continue;
+        }
+        struct hdr_output_metadata meta;
+        memset(&meta, 0, sizeof meta);
+        meta.metadata_type = HDMI_STATIC_METADATA_TYPE1;
+        struct hdr_metadata_infoframe *fi = &meta.hdmi_metadata_type1;
+        fi->eotf = HDMI_EOTF_SMPTE_ST2084;
+        fi->metadata_type = HDMI_STATIC_METADATA_TYPE1;
+        // BT.2020 primaries corrected from DCI-P3
+        fi->display_primaries[0].x = 35400;
+        fi->display_primaries[0].y = 14600;
+        fi->display_primaries[1].x = 8500;
+        fi->display_primaries[1].y = 39850;
+        fi->display_primaries[2].x = 6550;
+        fi->display_primaries[2].y = 2300;
+        fi->white_point.x = 15635;
+        fi->white_point.y = 16450;
+        fi->max_display_mastering_luminance = 1000;
+        fi->min_display_mastering_luminance = 1;
+        fi->max_cll = 1000;
+        fi->max_fall = 400;
+        uint32_t blob = 0;
+        if (drmModeCreatePropertyBlob(card_fd, &meta, sizeof meta, &blob) !=
+            0) {
+            fprintf(stderr, "kms backend: hdr blob refused on %s: %s\n",
+                    o->name, strerror(errno));
+            drmModeDestroyPropertyBlob(card_fd, blob);
+            continue;
+        }
+        if (drmModeObjectSetProperty(card_fd, o->conn_id,
+                                     DRM_MODE_OBJECT_CONNECTOR, prop,
+                                     blob) != 0) {
+            fprintf(stderr, "kms backend: hdr metadata refused on %s: %s\n",
+                    o->name, strerror(errno));
+            drmModeDestroyPropertyBlob(card_fd, blob);
+            continue;
+        }
+        hdr_blob[i] = blob;
+        fprintf(stderr, "kms backend: hdr armed on %s (pq, bt.2020)\n",
+                o->name);
+        uint64_t cs =
+            conn_prop_enum(o->conn_id, "Colorspace", "BT2020_RGB");
+        if (cs) {
+            uint32_t cs_id = conn_prop_id(o->conn_id, "Colorspace");
+            drmModeObjectSetProperty(card_fd, o->conn_id,
+                                     DRM_MODE_OBJECT_CONNECTOR, cs_id, cs);
+        }
+    }
+}
+
+static void hdr_disarm(void) {
+    for (int i = 0; i < X12_OUT_MAX; i++) {
+        if (!hdr_blob[i]) {
+            continue;
+        }
+        struct output *o = &outs[i];
+        if (o->conn_id) {
+            uint32_t prop = conn_prop_id(o->conn_id, "HDR_OUTPUT_METADATA");
+            if (prop) {
+                drmModeObjectSetProperty(card_fd, o->conn_id,
+                                         DRM_MODE_OBJECT_CONNECTOR, prop, 0);
+            }
+        }
+        drmModeDestroyPropertyBlob(card_fd, hdr_blob[i]);
+        hdr_blob[i] = 0;
     }
 }
 
@@ -769,6 +967,7 @@ static void flip_handler(int fd, unsigned int seq, unsigned int tv_sec,
     (void)fd;
     (void)seq;
     uint64_t ts = (uint64_t)tv_sec * 1000000000ull + (uint64_t)tv_usec * 1000ull;
+    fps_flip(ts);
     if (!user) {
         return;
     }
@@ -865,18 +1064,70 @@ static void out_wait(struct output *o) {
 
 static int kms_init(int argc, char **argv) {
     const char *node = NULL;
+    fps.enabled = 1;
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--kms") == 0 && i + 1 < argc) {
-            node = argv[i + 1];
+        if (strcmp(argv[i], "--kms-node") == 0 && i + 1 < argc) {
+            node = argv[++i];
+        } else if (strcmp(argv[i], "--kms") == 0) {
+            // the flag no longer eats what follows: a peek decides, the
+            // next flag keeps its own argument
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                node = argv[i + 1];
+            }
         }
         if (strcmp(argv[i], "--ppm") == 0 && i + 1 < argc) {
             snprintf(ppm_path, sizeof ppm_path, "%s", argv[i + 1]);
+        } else if (strcmp(argv[i], "--heads") == 0 && i + 1 < argc) {
+            max_heads = atoi(argv[++i]);
+            if (max_heads < 1) {
+                max_heads = 1;
+            }
+            if (max_heads > X12_OUT_MAX) {
+                max_heads = X12_OUT_MAX;
+            }
+        } else if (strcmp(argv[i], "--hdr") == 0) {
+            hdr_wanted = 1;
+        } else if (strcmp(argv[i], "--no-fps-stats") == 0) {
+            fps.enabled = 0;
         }
     }
     if (!node) {
-        fprintf(stderr, "x12-server: --kms needs a drm node\n");
+        // a plain --kms takes the first real card, a multi gpu box
+        // names its node with --kms-node instead
+        DIR *d = opendir("/dev/dri");
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d))) {
+                if (strncmp(e->d_name, "card", 4) != 0) {
+                    continue;
+                }
+                const char *s = e->d_name + 4;
+                int all_digits = *s != 0;
+                while (*s) {
+                    if (*s < '0' || *s > '9') {
+                        all_digits = 0;
+                        break;
+                    }
+                    s++;
+                }
+                if (!all_digits) {
+                    continue;
+                }
+                static char picked[288];
+                snprintf(picked, sizeof picked, "/dev/dri/%s", e->d_name);
+                node = picked;
+                break;
+            }
+            closedir(d);
+        }
+    }
+    if (!node) {
+        fprintf(stderr,
+                "x12-server: --kms found no /dev/dri/cardN, pass "
+                "--kms-node /dev/dri/card0 explicitly\n");
         return -1;
     }
+    fps.span_start = now_ns();
     static const struct x12_seat_ops seat_ops = {
         .on_pause = kms_seat_pause,
         .on_resume = kms_seat_resume,
@@ -914,7 +1165,7 @@ static int kms_init(int argc, char **argv) {
                 strerror(errno));
         goto fail;
     }
-    for (int i = 0; i < res->count_connectors && n_out_slots < X12_OUT_MAX;
+    for (int i = 0; i < res->count_connectors && n_out_slots < max_heads;
          i++) {
         output_bring_up(res, res->connectors[i]);
     }
@@ -924,6 +1175,9 @@ static int kms_init(int argc, char **argv) {
                 "x12-server: no usable connector with a live crtc on %s\n",
                 node);
         goto fail;
+    }
+    if (hdr_wanted) {
+        hdr_arm();
     }
 
     memset(&evctx, 0, sizeof evctx);
@@ -974,6 +1228,7 @@ fail:
 }
 
 static void kms_destroy(void) {
+    fps_report();
     if (udev_mon) {
         udev_monitor_unref(udev_mon);
         udev_mon = NULL;
@@ -984,6 +1239,9 @@ static void kms_destroy(void) {
     }
     if (card_fd < 0) {
         return;
+    }
+    if (hdr_wanted) {
+        hdr_disarm();
     }
     for (int i = 0; i < X12_OUT_MAX; i++) {
         struct output *o = &outs[i];
@@ -1299,7 +1557,7 @@ static void recheck_connectors(void) {
     if (!res) {
         return;
     }
-    for (int i = 0; i < res->count_connectors && n_out_slots < X12_OUT_MAX;
+    for (int i = 0; i < res->count_connectors && n_out_slots < max_heads;
          i++) {
         int owned = 0;
         for (int k = 0; k < n_out_slots; k++) {
