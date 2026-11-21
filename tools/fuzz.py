@@ -25,7 +25,7 @@ def load_corpus(path):
     return corpus
 
 
-def mutate(rng, data):
+def mutate(rng, data, depth=0):
     kind = rng.randrange(0, 4)
     buf = bytearray(data)
     if kind == 0:  # bit flips
@@ -39,8 +39,13 @@ def mutate(rng, data):
         for _ in range(rng.randrange(1, 16)):
             buf.append(rng.randrange(0, 256))
     else:  # splice with another frame
-        cut = rng.randrange(0, len(buf))
-        del buf[cut:]
+        # a second frame starts mid buffer: the decoder sees a short
+        # first frame followed by whatever the tail brings, the depth
+        # cap keeps a nested splice from recursing forever
+        cut = rng.randrange(1, len(buf)) if len(buf) > 1 else 1
+        tail = bytearray(mutate(rng, bytes(buf[:cut]), depth + 1)) if depth < 3 \
+            else buf[:cut]
+        buf = buf[:cut] + bytearray(tail)
     return bytes(buf)
 
 
