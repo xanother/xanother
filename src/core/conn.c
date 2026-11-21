@@ -83,8 +83,23 @@ uint64_t x12_conn_mint_session(struct x12_conn *c) {
     return token;
 }
 
+// a session is worth a resume slot only when it built something: a
+// hello only probe parks nothing, its object table still holds the
+// two singletons and nothing else
+static int conn_has_state(const struct x12_conn *c) {
+    for (uint32_t id = X12_OBJ_ID_REGISTRY + 1; id < X12_MAX_OBJECTS; id++) {
+        if (c->objects.slots[id].kind != OBJ_FREE) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int x12_conn_park(struct x12_conn *c, uint64_t ttl_ns) {
-    if (c->resume_token == 0 || n_parked >= X12_MAX_CLIENTS) {
+    // one slot always stays open for a fresh client, parked sessions
+    // must not be able to wall the door shut by cycling connections
+    if (c->resume_token == 0 || !conn_has_state(c) ||
+        n_parked >= X12_MAX_CLIENTS - 1) {
         return 0;
     }
     // whatever the transport had not finished dies with it, the client
@@ -126,6 +141,10 @@ struct x12_conn *x12_conn_resume(struct x12_conn *fresh, uint64_t token) {
         p->out_fds_sent = fresh->out_fds_sent;
         p->parked = 0;
         p->dead = 0;
+        // the token belonged to the session that just came home, the
+        // fresh conn loses it: a later disconnect of its own must not
+        // park a session that does not exist under a stale token
+        fresh->resume_token = 0;
         // the fresh conn owns nothing any more, the pump moves the rest
         // of its input batch over before it goes
         fresh->fd = -1;
@@ -246,6 +265,16 @@ int x12_conn_event_ts(struct x12_conn *c, const x12_iface_desc *iface,
 int x12_conn_event_fd(struct x12_conn *c, const x12_iface_desc *iface,
                       const char *evt, uint32_t object, x12_arg *args,
                       size_t nargs, size_t fd_arg_index, int fd) {
+    if (c->tls || c->net) {
+        // fd passing does not exist past unix sockets: refuse the
+        // event loudly instead of queueing a descriptor the flush
+        // would ignore and leak
+        fprintf(stderr,
+                "x12-server: fd passing refused on network transport\n");
+        x12_conn_error(c, X12_ERROR_CODE_BAD_VALUE, object);
+        close(fd);
+        return -1;
+    }
     if (c->dead || c->parked) {
         // the event itself would be dropped the same way, the
         // descriptor must not queue up behind it
