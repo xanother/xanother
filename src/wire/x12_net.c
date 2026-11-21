@@ -30,6 +30,7 @@ enum { X12_SUN_PATH_MAX = sizeof(((struct sockaddr_un *)0)->sun_path) };
 // a blackholed route keeps connect() in the kernel until the tcp
 // give-up timer, so the dial gets its own deadline instead of hanging
 enum { X12_DIAL_TIMEOUT_MS = 10000 };
+enum { X12_HANDSHAKE_TIMEOUT_MS = 10000 };
 
 static int
 connect_deadline(int s, const struct sockaddr *sa, socklen_t len)
@@ -254,14 +255,34 @@ x12_net_accept(void *tls_ctx, const struct x12_net_addr *a, int fd,
         return -1;
     }
     SSL_set_fd(ssl, fd);
-    // the handshake runs while the fd is still blocking, the poll loop
-    // owns the pacing after the nonblocking flip
-    if (SSL_accept(ssl) != 1) {
+    // the handshake gets one bounded wait: a client that never finishes
+    // it must not hold the slot forever, the poll deadline owns the
+    // pacing and the failure names itself
+    x12_net_set_nonblock(fd);
+    int ok = 0;
+    for (;;) {
+        int rc = SSL_accept(ssl);
+        if (rc == 1) {
+            ok = 1;
+            break;
+        }
+        int err = SSL_get_error(ssl, rc);
+        if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+            break;
+        }
+        struct pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = err == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT;
+        pfd.revents = 0;
+        if (poll(&pfd, 1, X12_HANDSHAKE_TIMEOUT_MS) <= 0) {
+            break;
+        }
+    }
+    if (!ok) {
         tls_log("tls accept handshake failed");
         SSL_free(ssl);
         return -1;
     }
-    x12_net_set_nonblock(fd);
     *tls_out = ssl;
     return 0;
 }
