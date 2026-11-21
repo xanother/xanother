@@ -21,7 +21,17 @@ CFLAGS="-std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -I src/wire -I src/core -I 
 SYS_CFLAGS=$(pkg-config --cflags libdrm libsystemd xkbcommon egl glesv3 2>/dev/null || \
     pkg-config --cflags libdrm libsystemd xkbcommon egl glesv2 2>/dev/null || true)
 
-gcc $CFLAGS $SYS_CFLAGS -o build/x12-server \
+# libinput is optional at build time: the source compiles either way,
+# a build without the library gets the polite stub and --evdev stays
+# the input path
+LI_CFLAGS=
+LI_LIBS=
+if pkg-config --exists libinput 2>/dev/null; then
+    LI_CFLAGS="$(pkg-config --cflags libinput) -DX12_HAVE_LIBINPUT"
+    LI_LIBS=$(pkg-config --libs libinput)
+fi
+
+gcc $CFLAGS $SYS_CFLAGS $LI_CFLAGS -o build/x12-server \
     src/server/main.c \
     src/core/conn.c \
     src/wire/x12_net.c \
@@ -36,6 +46,7 @@ gcc $CFLAGS $SYS_CFLAGS -o build/x12-server \
     src/input/input.c \
     src/input/source_file.c \
     src/input/source_evdev.c \
+    src/input/source_libinput.c \
     src/data/selection.c \
     src/render/cpu.c \
     src/render/gpu.c \
@@ -43,7 +54,8 @@ gcc $CFLAGS $SYS_CFLAGS -o build/x12-server \
     src/backend/seat.c \
     src/wire/x12_wire.c \
     build/gen/x12_tables.c \
-    -lxkbcommon -ldl -ldrm -ludev -lsystemd -lssl -lcrypto -lz
+    -lxkbcommon -ldl -ldrm -ludev -lsystemd -lssl -lcrypto -lz \
+    $LI_LIBS
 
 gcc $CFLAGS -o build/c_roundtrip \
     tests/c_roundtrip.c \

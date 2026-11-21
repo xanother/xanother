@@ -182,7 +182,13 @@ int main(int argc, char **argv) {
     x12_windows_set_output(canvas_w, canvas_h);
 
     // input sources feed the router, --input opens the event line file
-    // and --evdev may repeat for every device node
+    // and --evdev may repeat for every device node. libinput is the
+    // default seat input when the build found libinput and the seat
+    // answers, --no-libinput pins the raw evdec path, --libinput
+    // forces the attempt even on a build that never had it (the stub
+    // refuses politely)
+    // -1 = auto, 1 = forced on, 0 = off
+    int want_libinput = -1;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--input") == 0 && i + 1 < argc) {
             i++;
@@ -206,6 +212,29 @@ int main(int argc, char **argv) {
                 }
                 return 1;
             }
+        } else if (strcmp(argv[i], "--libinput") == 0) {
+            want_libinput = 1;
+        } else if (strcmp(argv[i], "--no-libinput") == 0) {
+            want_libinput = 0;
+        }
+    }
+
+    // the seat input: libinput carries calibration, acceleration and
+    // device hotplug that the raw evdec lacks. auto stands for "when
+    // the build had libinput", a failed seat start still leaves the
+    // server alive, the raw paths keep feeding the router
+    int libinput_on = want_libinput;
+#ifdef X12_HAVE_LIBINPUT
+    if (libinput_on < 0) {
+        libinput_on = 1;
+    }
+#endif
+    if (libinput_on > 0) {
+        if (x12_libinput_start() == 0) {
+            fprintf(stderr, "x12-server: libinput seat0 armed\n");
+        } else {
+            fprintf(stderr,
+                    "x12-server: libinput unavailable, evdev only\n");
         }
     }
 
@@ -247,7 +276,7 @@ int main(int argc, char **argv) {
     x12_selection_init(conns, X12_MAX_CLIENTS);
 
     while (running) {
-        struct pollfd pfd[2 + X12_MAX_CLIENTS + X12_EVDEV_MAX];
+        struct pollfd pfd[2 + X12_MAX_CLIENTS + X12_EVDEV_MAX + 1];
         size_t slot_of[1 + X12_MAX_CLIENTS];
         pfd[0].fd = srv;
         pfd[0].events = POLLIN;
@@ -270,6 +299,8 @@ int main(int argc, char **argv) {
         n += (nfds_t)n_file;
         int n_ev = x12_evdev_fill(&pfd[n], X12_EVDEV_MAX);
         n += (nfds_t)n_ev;
+        int n_li = x12_libinput_fill(&pfd[n], 1);
+        n += (nfds_t)n_li;
         int rc = poll(pfd, n, 250);
         if (rc < 0) {
             if (errno == EINTR) {
@@ -381,6 +412,7 @@ int main(int argc, char **argv) {
         // seat events before the composite pass reads the pointer
         x12_input_file_pump(&pfd[n_clients], n_file);
         x12_evdev_pump(&pfd[n_clients + n_file], n_ev);
+        x12_libinput_pump(&pfd[n_clients + n_file + n_ev], n_li);
         x12_input_dispatch();
         // the composite pass repaints whatever the commits damaged, one
         // pass per loop round keeps the damage accounting single writer
@@ -400,6 +432,7 @@ int main(int argc, char **argv) {
         }
     }
     x12_gpu_shutdown();
+    x12_libinput_stop();
     x12_backend->shutdown();
     close(srv);
     if (addr.kind == X12_NET_UNIX) {

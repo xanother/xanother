@@ -1,5 +1,6 @@
 // Copyright (c) lezginskiy <xanother-x12@proton.me>
 // SPDX-License-Identifier: MIT
+// Copyright (c) fluent1s (akemi) <m1st1kad3ad1y@gmail.com>
 
 #ifndef X12_SOURCE_H
 #define X12_SOURCE_H
@@ -31,5 +32,15 @@ void x12_input_file_pump(const struct pollfd *pfds, int count);
 int x12_evdev_add(const char *path);
 int x12_evdev_fill(struct pollfd *pfds, int max);
 void x12_evdev_pump(const struct pollfd *pfds, int count);
+
+// libinput source: a udev seat feeds the same router queue, pointer
+// deltas and absolute positions, buttons, keys, wheel notches and the
+// touchpad gestures the button model ignores. the build picks it up
+// when libinput-dev is present; without it the entry points compile to
+// a polite stub and --evdev stays the input path
+int x12_libinput_start(void);
+int x12_libinput_fill(struct pollfd *pfds, int max);
+void x12_libinput_pump(const struct pollfd *pfds, int count);
+void x12_libinput_stop(void);
 
 #endif

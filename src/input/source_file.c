@@ -1,5 +1,6 @@
 // Copyright (c) lezginskiy <xanother-x12@proton.me>
 // SPDX-License-Identifier: MIT
+// Copyright (c) fluent1s (akemi) <m1st1kad3ad1y@gmail.com>
 
 #include "source.h"
 
@@ -11,27 +12,36 @@
 #include "backend.h"
 #include "input.h"
 
-static int file_fd = -1;
-static char file_path[256];
-// a read may split lines anywhere, the tail waits here for the rest
-static char acc[1024];
-static size_t acc_len;
+// every module variable lives in one struct: the day this source needs
+// a context pointer or a test drives two instances, moving `struct
+// file_src` behind the api is a mechanical change instead of a hunt
+// through loose globals
+struct file_src {
+    int fd;
+    char path[256];
+    // a read may split lines anywhere, the tail waits here for the rest
+    char acc[1024];
+    size_t acc_len;
+};
+
+static struct file_src file_src = { .fd = -1, .path = "", .acc = "",
+                                    .acc_len = 0 };
 
 int x12_input_file_open(const char *path) {
-    if (strlen(path) >= sizeof file_path) {
+    if (strlen(path) >= sizeof file_src.path) {
         return -1;
     }
-    strcpy(file_path, path);
-    file_fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-    acc_len = 0;
-    return file_fd < 0 ? -1 : 0;
+    strcpy(file_src.path, path);
+    file_src.fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    file_src.acc_len = 0;
+    return file_src.fd < 0 ? -1 : 0;
 }
 
 int x12_input_file_fill(struct pollfd *pfds, int max) {
-    if (file_fd < 0 || max < 1) {
+    if (file_src.fd < 0 || max < 1) {
         return 0;
     }
-    pfds[0].fd = file_fd;
+    pfds[0].fd = file_src.fd;
     pfds[0].events = POLLIN;
     pfds[0].revents = 0;
     return 1;
@@ -79,41 +89,44 @@ static void push_line(char *line) {
 
 static void parse_buffer(void) {
     size_t start = 0;
-    for (size_t i = 0; i < acc_len; i++) {
-        if (acc[i] != '\n') {
+    for (size_t i = 0; i < file_src.acc_len; i++) {
+        if (file_src.acc[i] != '\n') {
             continue;
         }
-        acc[i] = 0;
-        if (start < i && acc[start] != '#') {
-            push_line(acc + start);
+        file_src.acc[i] = 0;
+        if (start < i && file_src.acc[start] != '#') {
+            push_line(file_src.acc + start);
         }
         start = i + 1;
     }
-    acc_len -= start;
-    memmove(acc, acc + start, acc_len);
+    file_src.acc_len -= start;
+    memmove(file_src.acc, file_src.acc + start, file_src.acc_len);
 }
 
 void x12_input_file_pump(const struct pollfd *pfds, int count) {
     for (int i = 0; i < count; i++) {
-        if (pfds[i].fd != file_fd || !(pfds[i].revents & (POLLIN | POLLHUP))) {
+        if (pfds[i].fd != file_src.fd ||
+            !(pfds[i].revents & (POLLIN | POLLHUP))) {
             continue;
         }
-        while (acc_len < sizeof acc - 1) {
-            ssize_t n = read(file_fd, acc + acc_len, sizeof acc - 1 - acc_len);
+        while (file_src.acc_len < sizeof file_src.acc - 1) {
+            ssize_t n = read(file_src.fd,
+                             file_src.acc + file_src.acc_len,
+                             sizeof file_src.acc - 1 - file_src.acc_len);
             if (n > 0) {
-                acc_len += (size_t)n;
+                file_src.acc_len += (size_t)n;
                 continue;
             }
             if (n == 0) {
                 // the writer went away, keep listening for the next one
-                close(file_fd);
-                file_fd = open(file_path,
-                               O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-                acc_len = 0;
+                close(file_src.fd);
+                file_src.fd = open(file_src.path,
+                                   O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+                file_src.acc_len = 0;
             }
             break;
         }
-        acc[acc_len] = 0;
+        file_src.acc[file_src.acc_len] = 0;
         parse_buffer();
     }
 }
