@@ -5,12 +5,13 @@
 
 #include <fcntl.h>
 #include <stdio.h>
+#include <signal.h>
+#include <setjmp.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <fcntl.h>
 #include <stdlib.h>
 
 #include "x12_protocol.h"
@@ -47,6 +48,14 @@ int x12_pool_create(struct x12_conn *c, uint32_t id, int fd, uint32_t size) {
         close(fd);
         return X12_ERROR_CODE_BAD_VALUE;
     }
+    // the size check and the seal are two reads, not one atomic step:
+    // the client can truncate between them. under the seal the size can
+    // never move again, so a second look here is authoritative
+    struct stat sealed;
+    if (fstat(fd, &sealed) != 0 || (uint64_t)sealed.st_size < size) {
+        close(fd);
+        return X12_ERROR_CODE_BAD_VALUE;
+    }
     uint8_t *map = mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
     if (map == MAP_FAILED) {
@@ -71,7 +80,10 @@ int x12_pool_create_net(struct x12_conn *c, uint32_t id, uint32_t size) {
     if (c->pool_bytes + size > X12_POOL_LIMIT) {
         return X12_ERROR_CODE_OUT_OF_MEMORY;
     }
-    uint8_t *map = malloc(size);
+    // calloc, not malloc: the client may write only part of the pool
+    // before the compositor blits it, and heap garbage must never reach
+    // the screen
+    uint8_t *map = calloc(1, size);
     if (!map) {
         return X12_ERROR_CODE_OUT_OF_MEMORY;
     }
@@ -179,24 +191,69 @@ void x12_buffer_destroy(struct x12_conn *c, uint32_t id) {
 
 // a real dma-buf exposes an exporter name in its fdinfo, anything else
 // on the wire claiming to be one gets turned away before it becomes a
-// buffer the compositor would happily scan out blind
-static int is_dmabuf_fd(int fd) {
+// buffer the compositor would happily scan out blind. when the kernel
+// exports a size line too it is returned as the authoritative byte
+// count, 0 means the kernel does not report one
+static uint64_t dmabuf_fd_size(int fd, int *is_dmabuf) {
     char path[64];
     snprintf(path, sizeof path, "/proc/self/fdinfo/%d", fd);
     FILE *f = fopen(path, "r");
     if (!f) {
+        *is_dmabuf = 0;
         return 0;
     }
     char line[256];
-    int found = 0;
+    uint64_t size = 0;
+    *is_dmabuf = 0;
     while (fgets(line, sizeof line, f)) {
         if (strncmp(line, "exp_name:", 9) == 0) {
-            found = 1;
-            break;
+            *is_dmabuf = 1;
+        }
+        else if (strncmp(line, "size:", 5) == 0) {
+            size = strtoull(line + 5, NULL, 10);
         }
     }
     fclose(f);
-    return found;
+    return size;
+}
+
+// a truncated dma-buf maps fine and explodes on the first pixel read:
+// the probe touches the last byte of the mapping under a sigbus catcher
+// so a lying client cannot kill the compositor later. single threaded,
+// the signal can only come from the probe's own access
+static sigjmp_buf probe_env;
+static volatile sig_atomic_t probe_active;
+
+static void probe_sigbus(int sig) {
+    (void)sig;
+    if (probe_active) {
+        probe_active = 0;
+        siglongjmp(probe_env, 1);
+    }
+}
+
+static int mapping_readable(uint8_t *map, size_t size) {
+    struct sigaction sa, old;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = probe_sigbus;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGBUS, &sa, &old) != 0) {
+        return 0;
+    }
+    int ok = 1;
+    if (sigsetjmp(probe_env, 1) == 0) {
+        probe_active = 1;
+        // the last page is where a truncated export bites, the first
+        // one never does
+        volatile uint8_t *p = map + size - 1;
+        (void)*p;
+    }
+    else {
+        ok = 0;
+    }
+    probe_active = 0;
+    sigaction(SIGBUS, &old, NULL);
+    return ok;
 }
 
 int x12_buffer_import(struct x12_conn *c, uint32_t id, int fd, uint32_t width,
@@ -208,25 +265,57 @@ int x12_buffer_import(struct x12_conn *c, uint32_t id, int fd, uint32_t width,
         close(fd);
         return X12_ERROR_CODE_BAD_VALUE;
     }
-    if (!is_dmabuf_fd(fd)) {
+    // the fdinfo size is the kernel's own word on the export, when it
+    // is present a short buffer dies here without any probing. the
+    // sigbus probe below stays as the fallback for kernels that do not
+    // report the size
+    int is_dmabuf = 0;
+    uint64_t fdinfo_size = dmabuf_fd_size(fd, &is_dmabuf);
+    if (!is_dmabuf) {
         close(fd);
         return X12_ERROR_CODE_BAD_VALUE;
     }
     // the mapping is a convenience for the composite fallback, a gpu
     // only buffer stays unmapped and reaches the screen through scanout
-    size_t size = (size_t)stride * height;
+    uint64_t full = (uint64_t)stride * height;
+    if (full > SIZE_MAX) {
+        close(fd);
+        return X12_ERROR_CODE_BAD_VALUE;
+    }
+    size_t size = (size_t)full;
+    if (fdinfo_size > 0 && fdinfo_size < full) {
+        close(fd);
+        return X12_ERROR_CODE_BAD_VALUE;
+    }
+    // an export that reports its size gets the cheap fstat answer, the
+    // rest proves the mapping by touching it before the buffer ever
+    // reaches the compositor
+    struct stat dst;
+    if (fstat(fd, &dst) == 0 && dst.st_size > 0 &&
+        (uint64_t)dst.st_size < full) {
+        close(fd);
+        return X12_ERROR_CODE_BAD_VALUE;
+    }
     uint8_t *map = mmap(0, size, PROT_READ, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) {
+        map = NULL;
+    }
+    else if (!mapping_readable(map, size)) {
+        munmap(map, size);
+        close(fd);
+        return X12_ERROR_CODE_BAD_VALUE;
+    }
     if (x12_objects_alloc(&c->objects, id, OBJ_BUFFER,
                           x12_iface_find("x12_buffer")) != 0) {
-        if (map != MAP_FAILED) {
+        if (map) {
             munmap(map, size);
         }
         close(fd);
         return X12_ERROR_CODE_INVALID_ID;
     }
     struct x12_object *o = x12_objects_get(&c->objects, id);
-    o->as.buffer.pixels = map == MAP_FAILED ? NULL : map;
-    o->as.buffer.map_size = map == MAP_FAILED ? 0 : size;
+    o->as.buffer.pixels = map;
+    o->as.buffer.map_size = map ? size : 0;
     o->as.buffer.width = width;
     o->as.buffer.height = height;
     o->as.buffer.stride = stride;
@@ -239,6 +328,14 @@ int x12_buffer_import(struct x12_conn *c, uint32_t id, int fd, uint32_t width,
 
 // teardown hook for the reap path, the mapping goes away with the client
 void x12_buffers_teardown(struct x12_conn *c) {
+    // imported dma-bufs close with the client too, they live outside
+    // the pools the loop below unmaps
+    for (uint32_t id = 1; id < X12_MAX_OBJECTS; id++) {
+        struct x12_object *o = x12_objects_get(&c->objects, id);
+        if (o && o->kind == OBJ_BUFFER) {
+            x12_buffer_destroy(c, id);
+        }
+    }
     for (uint32_t id = 1; id < X12_MAX_OBJECTS; id++) {
         struct x12_object *o = x12_objects_get(&c->objects, id);
         if (o && o->kind == OBJ_SHM_POOL) {
